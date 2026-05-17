@@ -1,0 +1,22 @@
+[package]
+name = "tanaterm"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal terminal GUI for macOS, written in Rust"
+license = "MIT"
+repository = "https://github.com/sny-tanaka/tanaterm"
+readme = "README.md"
+
+[dependencies]
+eframe = "0.28"
+portable-pty = "0.8"
+vt100 = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+anyhow = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
