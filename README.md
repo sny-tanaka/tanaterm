@@ -32,6 +32,20 @@ cd tanaterm
 cargo run --release
 ```
 
+## Packaging (macOS .app)
+
+`cargo run` launches a bare binary, which Finder shows with a generic
+executable icon. To get a proper Finder/Dock app icon, build a `.app` bundle:
+
+```sh
+./scripts/bundle-macos.sh
+```
+
+This produces `target/release/tanaterm.app` (icon generated from
+`assets/icon.png` via the built-in `sips`/`iconutil` — no extra tooling).
+Double-click it in
+Finder, or drag it into `/Applications`.
+
 ## Configuration
 
 On first launch, tanaterm writes a default config file and prints its path to
@@ -70,6 +84,7 @@ Edit the file and restart tanaterm to apply changes.
 | `src/config.rs`  | Loading/writing `config.toml`                   |
 | `src/pty.rs`     | Spawning the shell on a PTY, reader thread      |
 | `src/app.rs`     | egui rendering of the terminal grid + key input |
+| `scripts/bundle-macos.sh` | Package the release binary as a `.app` bundle |
 
 ## License
 
