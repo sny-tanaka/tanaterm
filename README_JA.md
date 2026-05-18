@@ -32,6 +32,20 @@ cd tanaterm
 cargo run --release
 ```
 
+## パッケージング（macOS .app）
+
+`cargo run` は素のバイナリを起動するため、Finder では汎用実行ファイルの
+アイコンで表示されます。Finder / Dock 用のアプリアイコンを付けるには
+`.app` バンドルをビルドします。
+
+```sh
+./scripts/bundle-macos.sh
+```
+
+`target/release/tanaterm.app` が生成されます（アイコンは `assets/icon.png`
+から macOS 標準の `sips` / `iconutil` で生成。追加ツール不要）。Finder で
+ダブルクリックするか、`/Applications` にドラッグして使えます。
+
 ## 設定
 
 初回起動時に、tanaterm はデフォルトの設定ファイルを書き出し、そのパスを
@@ -70,6 +84,7 @@ login_shell = true
 | `src/config.rs`  | `config.toml` の読み込み・書き出し               |
 | `src/pty.rs`     | PTY 上でのシェル起動、読み取りスレッド            |
 | `src/app.rs`     | ターミナルグリッドの egui 描画とキー入力処理      |
+| `scripts/bundle-macos.sh` | リリースバイナリを `.app` バンドル化する |
 
 ## ライセンス
 
