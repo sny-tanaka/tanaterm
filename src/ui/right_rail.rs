@@ -159,7 +159,7 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
         .collect();
     // RECENT は最終実行が新しい順に並べる（PINNED は登録順のまま）。
     if section == Section::Recent {
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     }
     let ids: Vec<String> = entries.into_iter().map(|(id, _)| id).collect();
     let now_secs = clock::now_unix();
