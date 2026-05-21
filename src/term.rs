@@ -397,8 +397,7 @@ fn byte_line_is_prompt(line: &[u8]) -> bool {
         .position(|&b| b != b' ' && b != b'\t')
         .map(|p| &line[p..])
         .unwrap_or(&[]);
-    matches!(trimmed.first(), Some(b'$') | Some(b'%') | Some(b'#'))
-        && trimmed.get(1) == Some(&b' ')
+    matches!(trimmed.first(), Some(b'$') | Some(b'%') | Some(b'#')) && trimmed.get(1) == Some(&b' ')
 }
 
 /// scanner + converter + ブロックライフサイクルを 1 セッション分まとめた高レベル層。

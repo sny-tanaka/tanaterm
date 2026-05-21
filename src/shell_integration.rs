@@ -161,7 +161,10 @@ mod tests {
         assert!(zdotdir.is_some(), "ZDOTDIR が設定される");
         let zshrc = std::fs::read_to_string(int.dir.join(".zshrc")).unwrap();
         assert!(zshrc.contains("133;C"), "preexec で C を出す");
-        assert!(zshrc.contains("source \"$HOME/.zshrc\""), "ユーザ rc を source");
+        assert!(
+            zshrc.contains("source \"$HOME/.zshrc\""),
+            "ユーザ rc を source"
+        );
         assert!(!int.suppress_login);
     }
 

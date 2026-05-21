@@ -135,7 +135,11 @@ fn command_add(ui: &mut egui::Ui, state: &mut AppState) {
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("↵ add").size(10.0).color(theme::AMBER));
-                    ui.label(egui::RichText::new("· esc cancel").size(10.0).color(theme::FG_3));
+                    ui.label(
+                        egui::RichText::new("· esc cancel")
+                            .size(10.0)
+                            .color(theme::FG_3),
+                    );
                 });
             });
     });

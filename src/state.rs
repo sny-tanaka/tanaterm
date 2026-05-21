@@ -306,8 +306,12 @@ fn default_id_counter() -> u64 {
 /// `"s105"` / `"f3"` のような「英字プレフィックス + 数字」id 群から数値接尾辞の最大値を返す
 /// （採番カウンタ復元用）。この形式以外（手編集による不正 id 等）は parse 失敗で無視する。
 fn max_id_suffix<'a>(ids: impl Iterator<Item = &'a str>) -> Option<u64> {
-    ids.filter_map(|id| id.trim_start_matches(|c: char| !c.is_ascii_digit()).parse::<u64>().ok())
-        .max()
+    ids.filter_map(|id| {
+        id.trim_start_matches(|c: char| !c.is_ascii_digit())
+            .parse::<u64>()
+            .ok()
+    })
+    .max()
 }
 
 /// 実パスの先頭が `$HOME` なら `~` に畳んだ表示文字列を返す。
@@ -856,8 +860,12 @@ impl AppState {
     /// 追加フォームの内容を新規 command として確定する。cmd が空なら追加せず閉じる。
     /// 手動追加した command は「手元に残したい」ものとみなして pinned=true で PINNED に置く。
     pub fn commit_command_add(&mut self) {
-        let cmd = std::mem::take(&mut self.ui.command_add_cmd).trim().to_string();
-        let desc = std::mem::take(&mut self.ui.command_add_desc).trim().to_string();
+        let cmd = std::mem::take(&mut self.ui.command_add_cmd)
+            .trim()
+            .to_string();
+        let desc = std::mem::take(&mut self.ui.command_add_desc)
+            .trim()
+            .to_string();
         self.ui.command_add_active = false;
         self.ui.command_add_focus_pending = false;
         if cmd.is_empty() {
@@ -970,9 +978,9 @@ impl AppState {
 
 /// `tanaterm-data.jsx` の INITIAL_* に対応する seed データ。
 mod seed {
-    use super::{Command, ShelfItem};
     #[cfg(test)]
     use super::{Block, OutputColor, OutputSpan, Session, SessionStatus};
+    use super::{Command, ShelfItem};
 
     #[cfg(test)]
     pub(super) fn sessions() -> Vec<Session> {
@@ -1583,7 +1591,11 @@ mod tests {
         s.ui.shell = crate::config::Shell::Bash;
         // seed では c1 が pin 済み・c10 が未 pin。状態を反転させて往復を確認。
         s.commands.iter_mut().find(|c| c.id == "c1").unwrap().pinned = false;
-        s.commands.iter_mut().find(|c| c.id == "c10").unwrap().pinned = true;
+        s.commands
+            .iter_mut()
+            .find(|c| c.id == "c10")
+            .unwrap()
+            .pinned = true;
 
         let restored = AppState::from_persistent(s.to_persistent());
 
@@ -1593,8 +1605,22 @@ mod tests {
         assert!(!restored.ui.rail_left_visible);
         assert_eq!(restored.ui.shell, crate::config::Shell::Bash);
         // pin 状態が往復する。
-        assert!(!restored.commands.iter().find(|c| c.id == "c1").unwrap().pinned);
-        assert!(restored.commands.iter().find(|c| c.id == "c10").unwrap().pinned);
+        assert!(
+            !restored
+                .commands
+                .iter()
+                .find(|c| c.id == "c1")
+                .unwrap()
+                .pinned
+        );
+        assert!(
+            restored
+                .commands
+                .iter()
+                .find(|c| c.id == "c10")
+                .unwrap()
+                .pinned
+        );
         // blocks は復元しない（実行時データ）。
         assert!(restored.sessions.iter().all(|s| s.blocks.is_empty()));
         // 各セッションの PTY 起動が積まれる。
