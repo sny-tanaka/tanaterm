@@ -1,262 +1,135 @@
+//! Phase 1 mock UI のオーケストレータ。
+//!
+//! 各 panel は `ui::{topbar, left_rail, right_rail, central, statusbar, toast}` に分割し、
+//! ここでは:
+//! - egui Visuals 初期化（`theme::apply`）
+//! - キーボードショートカット（⌘1/⌘2/⌘T/⌘W/⌘K）
+//! - パネル描画順（CentralPanel を最後に show する egui 制約を遵守）
+//! - Toast の TTL 失効ケア
+//!
+//! PTY は Phase 2 で central から呼ぶ。Phase 1 では `state.run_active_input` が mock 実行。
+
 use eframe::egui;
 
 use crate::config::Config;
-use crate::pty::PtySession;
+use crate::state::AppState;
+use crate::theme;
+use crate::ui;
 
 pub struct TanaTermApp {
+    #[allow(dead_code)] // Phase 2 で PTY 起動時の shell 選択などに利用予定。
     config: Config,
-    session: Option<PtySession>,
+    state: AppState,
 }
 
 impl TanaTermApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, config: Config) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
+        theme::apply(&cc.egui_ctx);
+        ui::widgets::register_icons(&cc.egui_ctx);
         Self {
             config,
-            session: None,
+            state: AppState::seed(),
         }
     }
 }
 
 impl eframe::App for TanaTermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let font_id = egui::FontId::monospace(self.config.font_size);
-        let (char_w, line_h) =
-            ctx.fonts(|fonts| (fonts.glyph_width(&font_id, 'M'), fonts.row_height(&font_id)));
+        let now = ctx.input(|i| i.time);
+        self.state.tick_toast(now);
+        self.handle_shortcuts(ctx);
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(0x0d, 0x0d, 0x0d)))
-            .show(ctx, |ui| {
-                let avail = ui.available_size();
-                let cols = ((avail.x / char_w).floor() as u16).max(1);
-                let rows = ((avail.y / line_h).floor() as u16).max(1);
+        // egui の制約: CentralPanel は最後に show すること。残りの
+        // TopBottomPanel / SidePanel は CentralPanel より前に show する。
+        ui::topbar::show(ctx, &mut self.state);
+        ui::statusbar::show(ctx, &self.state);
+        if self.state.ui.rail_left_visible {
+            ui::left_rail::show(ctx, &mut self.state);
+        }
+        if self.state.ui.rail_right_visible {
+            ui::right_rail::show(ctx, &mut self.state);
+        }
+        ui::central::show(ctx, &mut self.state);
 
-                // Lazily spawn the shell once we know the widget size, then
-                // keep the PTY in sync with the window.
-                match self.session.as_mut() {
-                    Some(session) => session.resize(rows, cols),
-                    None => match PtySession::spawn(&self.config, rows, cols, ctx.clone()) {
-                        Ok(session) => self.session = Some(session),
-                        Err(err) => {
-                            ui.colored_label(
-                                egui::Color32::LIGHT_RED,
-                                format!("Failed to start shell: {err}"),
-                            );
-                            return;
-                        }
-                    },
-                }
-
-                let input = collect_input(ctx);
-                if !input.is_empty() {
-                    if let Some(session) = self.session.as_mut() {
-                        session.send(&input);
-                    }
-                }
-
-                self.paint_screen(ui, &font_id, char_w, line_h);
-            });
+        // Toast は最後に central 領域上にオーバレイ描画。
+        let main_rect = central_main_rect(ctx, &self.state);
+        ui::toast::show(ctx, &self.state, main_rect);
     }
 }
 
 impl TanaTermApp {
-    fn paint_screen(
-        &mut self,
-        ui: &mut egui::Ui,
-        font_id: &egui::FontId,
-        char_w: f32,
-        line_h: f32,
-    ) {
-        let Some(session) = self.session.as_ref() else {
-            return;
-        };
-        let Ok(parser) = session.parser.lock() else {
-            return;
-        };
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // rename 中は Esc キャンセル / Enter 確定が個別 widget 側で処理されるので
+        // ここではグローバル系のみハンドル。
+        let toggle_left = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Num1);
+        let toggle_right = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Num2);
+        let new_session = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T);
+        let close_session = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
+        let focus_search = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
 
-        let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
-        let origin = response.rect.min;
+        let mut do_new = false;
+        let mut do_close = false;
+        let mut do_focus_search = false;
+        ctx.input_mut(|i| {
+            if i.consume_shortcut(&toggle_left) {
+                self.state.ui.rail_left_visible = !self.state.ui.rail_left_visible;
+            }
+            if i.consume_shortcut(&toggle_right) {
+                self.state.ui.rail_right_visible = !self.state.ui.rail_right_visible;
+            }
+            if i.consume_shortcut(&new_session) {
+                do_new = true;
+            }
+            if i.consume_shortcut(&close_session) {
+                do_close = true;
+            }
+            if i.consume_shortcut(&focus_search) {
+                do_focus_search = true;
+            }
+        });
 
-        for row in 0..rows {
-            for col in 0..cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                let pos = egui::pos2(
-                    origin.x + col as f32 * char_w,
-                    origin.y + row as f32 * line_h,
-                );
-
-                let bg = to_color(cell.bgcolor());
-                if let Some(bg) = bg {
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(pos, egui::vec2(char_w, line_h)),
-                        0.0,
-                        bg,
-                    );
-                }
-
-                if cell.has_contents() {
-                    let fg = to_color(cell.fgcolor())
-                        .unwrap_or(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0));
-                    painter.text(
-                        pos,
-                        egui::Align2::LEFT_TOP,
-                        cell.contents(),
-                        font_id.clone(),
-                        fg,
-                    );
-                }
+        if do_new {
+            self.state.new_session("new session", "~/");
+            let now = ctx.input(|i| i.time);
+            self.state.show_toast("New session", None, now);
+        }
+        if do_close {
+            if let Some(id) = self.state.ui.active_session_id.clone() {
+                self.state.close_session(&id);
             }
         }
+        if do_focus_search {
+            ctx.memory_mut(|m| m.request_focus(ui::topbar::search_id()));
+        }
 
-        if !screen.hide_cursor() {
-            let (crow, ccol) = screen.cursor_position();
-            let pos = egui::pos2(
-                origin.x + ccol as f32 * char_w,
-                origin.y + crow as f32 * line_h,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(pos, egui::vec2(char_w, line_h)),
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(0xe0, 0xe0, 0xe0, 110),
-            );
+        // rename 中に Esc が押されたら inline rename をキャンセルする
+        // （session / shelf 共通のキャンセル経路をここに一本化している）。
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.state.ui.rename_target.is_some()
+        {
+            self.state.cancel_rename();
         }
     }
 }
 
-/// Translate the keyboard/clipboard events for this frame into the byte
-/// sequence a shell expects.
-fn collect_input(ctx: &egui::Context) -> Vec<u8> {
-    let mut out = Vec::new();
-    ctx.input(|i| {
-        for event in &i.events {
-            match event {
-                egui::Event::Text(text) => out.extend_from_slice(text.as_bytes()),
-                egui::Event::Paste(text) => out.extend_from_slice(text.as_bytes()),
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => {
-                    if modifiers.ctrl || modifiers.command {
-                        if let Some(byte) = ctrl_byte(*key) {
-                            out.push(byte);
-                            continue;
-                        }
-                    }
-                    if let Some(seq) = key_sequence(*key) {
-                        out.extend_from_slice(seq);
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-    out
-}
-
-/// Control characters for Ctrl+<letter> (and a few common combos).
-fn ctrl_byte(key: egui::Key) -> Option<u8> {
-    use egui::Key::*;
-    let letter = match key {
-        A => b'a',
-        B => b'b',
-        C => b'c',
-        D => b'd',
-        E => b'e',
-        F => b'f',
-        G => b'g',
-        H => b'h',
-        I => b'i',
-        J => b'j',
-        K => b'k',
-        L => b'l',
-        M => b'm',
-        N => b'n',
-        O => b'o',
-        P => b'p',
-        Q => b'q',
-        R => b'r',
-        S => b's',
-        T => b't',
-        U => b'u',
-        V => b'v',
-        W => b'w',
-        X => b'x',
-        Y => b'y',
-        Z => b'z',
-        _ => return None,
+/// Toast 描画用に CentralPanel 領域を概算する。
+/// 左右 rail と top/bottom bar を除いた残り。
+fn central_main_rect(ctx: &egui::Context, state: &AppState) -> egui::Rect {
+    let screen = ctx.screen_rect();
+    let left = if state.ui.rail_left_visible {
+        theme::dims::RAIL_L
+    } else {
+        0.0
     };
-    Some(letter & 0x1f)
-}
-
-/// Escape sequences for non-text keys.
-fn key_sequence(key: egui::Key) -> Option<&'static [u8]> {
-    use egui::Key::*;
-    Some(match key {
-        Enter => b"\r",
-        Backspace => b"\x7f",
-        Tab => b"\t",
-        Escape => b"\x1b",
-        ArrowUp => b"\x1b[A",
-        ArrowDown => b"\x1b[B",
-        ArrowRight => b"\x1b[C",
-        ArrowLeft => b"\x1b[D",
-        Home => b"\x1b[H",
-        End => b"\x1b[F",
-        Delete => b"\x1b[3~",
-        PageUp => b"\x1b[5~",
-        PageDown => b"\x1b[6~",
-        _ => return None,
-    })
-}
-
-/// Map a vt100 color to an egui color. `None` means "use the terminal default"
-/// (transparent background / default foreground).
-fn to_color(color: vt100::Color) -> Option<egui::Color32> {
-    match color {
-        vt100::Color::Default => None,
-        vt100::Color::Rgb(r, g, b) => Some(egui::Color32::from_rgb(r, g, b)),
-        vt100::Color::Idx(idx) => Some(ansi_256(idx)),
-    }
-}
-
-/// Standard xterm 256-color palette.
-fn ansi_256(idx: u8) -> egui::Color32 {
-    const BASE: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00),
-        (0xcd, 0x00, 0x00),
-        (0x00, 0xcd, 0x00),
-        (0xcd, 0xcd, 0x00),
-        (0x00, 0x00, 0xee),
-        (0xcd, 0x00, 0xcd),
-        (0x00, 0xcd, 0xcd),
-        (0xe5, 0xe5, 0xe5),
-        (0x7f, 0x7f, 0x7f),
-        (0xff, 0x00, 0x00),
-        (0x00, 0xff, 0x00),
-        (0xff, 0xff, 0x00),
-        (0x5c, 0x5c, 0xff),
-        (0xff, 0x00, 0xff),
-        (0x00, 0xff, 0xff),
-        (0xff, 0xff, 0xff),
-    ];
-
-    if idx < 16 {
-        let (r, g, b) = BASE[idx as usize];
-        return egui::Color32::from_rgb(r, g, b);
-    }
-    if idx < 232 {
-        let i = idx - 16;
-        let levels = [0u8, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
-        let r = levels[(i / 36) as usize];
-        let g = levels[((i / 6) % 6) as usize];
-        let b = levels[(i % 6) as usize];
-        return egui::Color32::from_rgb(r, g, b);
-    }
-    let v = 8 + 10 * (idx - 232);
-    egui::Color32::from_rgb(v, v, v)
+    let right = if state.ui.rail_right_visible {
+        theme::dims::RAIL_R
+    } else {
+        0.0
+    };
+    egui::Rect::from_min_max(
+        egui::pos2(screen.left() + left, screen.top() + theme::dims::TOPBAR),
+        egui::pos2(
+            screen.right() - right,
+            screen.bottom() - theme::dims::STATUSBAR,
+        ),
+    )
 }

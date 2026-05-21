@@ -1,8 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod clock;
 mod config;
+// Phase 0/1 では未配線。Phase 2 で `app` から呼び出す。
+#[allow(dead_code)]
 mod pty;
+mod state;
+mod theme;
+mod ui;
 
 use eframe::egui;
 
