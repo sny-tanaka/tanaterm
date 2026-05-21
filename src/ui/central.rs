@@ -127,7 +127,7 @@ fn empty_placeholder(ui: &mut egui::Ui, session: &Session) {
 }
 
 fn draw_block(ui: &mut egui::Ui, block: &Block) {
-    let running = block.exit_code.is_none();
+    let running = block.running;
     let err = matches!(block.exit_code, Some(c) if c != 0);
     let border = if running {
         theme::AMBER
@@ -321,6 +321,7 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
     let mut submit = false;
     let mut history_up = false;
     let mut history_down = false;
+    let mut complete = false;
 
     // input_buffer を一旦取り出し、TextEdit に渡している間は state を非借用にする。
     // describe→state.* を呼び出せる構造を保つための定石パターン。
@@ -361,16 +362,22 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                                 .size(13.0),
                         );
                     let r = ui.add(edit);
+                    // singleline は Enter でフォーカスを失うため、その瞬間は has_focus() が
+                    // false になる。Enter は lost_focus() + キー押下で検出する（egui の定石）。
+                    if r.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
                     if r.has_focus() {
-                        ui.ctx().input(|i| {
-                            if i.key_pressed(egui::Key::Enter) {
-                                submit = true;
-                            }
+                        ui.ctx().input_mut(|i| {
                             if i.key_pressed(egui::Key::ArrowUp) {
                                 history_up = true;
                             }
                             if i.key_pressed(egui::Key::ArrowDown) {
                                 history_down = true;
+                            }
+                            // Tab はフォーカス移動に使われるので consume して補完に回す。
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                                complete = true;
                             }
                         });
                     }
@@ -408,12 +415,17 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if submit {
-        state.run_active_input(clock::now_hhmm());
+        state.submit_input(clock::now_hhmm());
+        // 連続入力できるよう入力欄に再フォーカスする（Enter で外れた分を取り戻す）。
+        ui.ctx().memory_mut(|m| m.request_focus(input_id()));
     }
     if history_up {
         state.step_history(-1);
     }
     if history_down {
         state.step_history(1);
+    }
+    if complete {
+        state.tab_complete();
     }
 }

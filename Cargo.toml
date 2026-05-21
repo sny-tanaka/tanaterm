@@ -11,7 +11,6 @@ readme = "README.md"
 # persistence: パネルのリサイズ高さ等の egui memory をディスクに永続化する。
 eframe = { version = "0.28", features = ["persistence"] }
 portable-pty = "0.8"
-vt100 = "0.15"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "5"

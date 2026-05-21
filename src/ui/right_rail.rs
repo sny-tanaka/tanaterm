@@ -10,7 +10,18 @@ use eframe::egui;
 
 use crate::state::{AppState, Command};
 use crate::theme;
-use crate::ui::widgets::{self, row, RowState};
+use crate::ui::left_rail::rename_edit;
+use crate::ui::widgets::{self, row, text_button, RowState};
+
+/// 追加フォーム cmd 欄の固定 Id。
+fn add_cmd_id() -> egui::Id {
+    egui::Id::new("tanaterm.command_add.cmd")
+}
+
+/// 追加フォーム desc 欄の固定 Id。
+fn add_desc_id() -> egui::Id {
+    egui::Id::new("tanaterm.command_add.desc")
+}
 
 pub fn show(ctx: &egui::Context, state: &mut AppState) {
     egui::SidePanel::right("rail_r")
@@ -25,6 +36,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             // COMMANDS は PINNED / RECENT を束ねる親見出し（数値カウントは出さない）。
             ui.add_space(10.0);
             widgets::section_header_plain(ui, "COMMANDS");
+            command_add(ui, state);
 
             // PINNED: リサイズ可能な上部パネル。
             egui::TopBottomPanel::top("rail_r_pinned")
@@ -65,15 +77,87 @@ impl Section {
     }
 }
 
+/// COMMANDS 見出し下の inline 追加 UI。閉じている時は "+ add command" ボタン、
+/// 開いている時は cmd / desc の 2 入力欄。cmd で Enter 確定 / Esc キャンセル（Esc は app 側）。
+fn command_add(ui: &mut egui::Ui, state: &mut AppState) {
+    if !state.ui.command_add_active {
+        if text_button(ui, "+ add command", None) {
+            state.start_command_add();
+        }
+        return;
+    }
+
+    // 確定は Enter のみ（`lost_focus && Enter`）。Tab 移動やフォーム外クリックでの blur 単独では
+    // 確定しない（rename_edit が blur でも確定するのとは非対称。誤確定を避けるため）。
+    let mut commit = false;
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        egui::Frame::none()
+            .stroke(egui::Stroke::new(1.0, theme::LINE_2))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_width((ui.available_width() - 10.0).max(60.0));
+                ui.spacing_mut().item_spacing.y = 4.0;
+
+                let cmd_edit = egui::TextEdit::singleline(&mut state.ui.command_add_cmd)
+                    .id(add_cmd_id())
+                    .frame(false)
+                    .desired_width(f32::INFINITY)
+                    .text_color(theme::FG_0)
+                    .font(egui::FontId::monospace(12.5))
+                    .hint_text(egui::RichText::new("command").color(theme::FG_3).size(12.0));
+                let cmd_resp = ui.add(cmd_edit);
+                if state.ui.command_add_focus_pending {
+                    cmd_resp.request_focus();
+                    state.ui.command_add_focus_pending = false;
+                }
+                // cmd 欄で Enter → 確定。
+                if cmd_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+
+                let desc_edit = egui::TextEdit::singleline(&mut state.ui.command_add_desc)
+                    .id(add_desc_id())
+                    .frame(false)
+                    .desired_width(f32::INFINITY)
+                    .text_color(theme::FG_2)
+                    .font(egui::FontId::proportional(11.0))
+                    .hint_text(
+                        egui::RichText::new("description (optional)")
+                            .color(theme::FG_3)
+                            .size(11.0),
+                    );
+                let desc_resp = ui.add(desc_edit);
+                if desc_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("↵ add").size(10.0).color(theme::AMBER));
+                    ui.label(
+                        egui::RichText::new("· esc cancel")
+                            .size(10.0)
+                            .color(theme::FG_3),
+                    );
+                });
+            });
+    });
+
+    if commit {
+        state.commit_command_add();
+    }
+}
+
 fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
-    let visible: Vec<Command> = state
+    let ids: Vec<String> = state
         .commands
         .iter()
         .filter(|c| section.contains(c))
-        .cloned()
+        .map(|c| c.id.clone())
         .collect();
 
-    if visible.is_empty() {
+    if ids.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(theme::spacing::PAD_X);
             let msg = match section {
@@ -85,9 +169,6 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
         return;
     }
 
-    let mut to_toggle_pin: Option<String> = None;
-    let mut to_insert: Option<String> = None;
-
     egui::ScrollArea::vertical()
         .id_source(match section {
             Section::Pinned => "rail_r_pinned_scroll",
@@ -97,40 +178,32 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
             let row_w = (ui.available_width() - 12.0).max(80.0);
-            for cmd in visible {
+            for id in ids {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    let resp = command_row(ui, &cmd, row_w);
-                    if resp.clicked_pin {
-                        to_toggle_pin = Some(cmd.id.clone());
-                    } else if resp.clicked_insert {
-                        to_insert = Some(cmd.id.clone());
-                    }
+                    command_row(ui, state, &id, row_w);
                 });
                 ui.add_space(2.0);
             }
         });
-
-    if let Some(id) = to_toggle_pin {
-        state.toggle_command_pin(&id);
-    }
-    if let Some(id) = to_insert {
-        let now = ui.input(|i| i.time);
-        state.insert_command(&id, now);
-    }
 }
 
-struct CommandRowResponse {
-    clicked_insert: bool,
-    clicked_pin: bool,
-}
+fn command_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
+    let cmd: Command = {
+        let Some(c) = state.commands.iter().find(|c| c.id == id) else {
+            return;
+        };
+        c.clone()
+    };
+    let renaming = state.is_renaming_command(id);
 
-fn command_row(ui: &mut egui::Ui, cmd: &Command, row_w: f32) -> CommandRowResponse {
+    let mut commit_now = false;
     let mut pin_rect = egui::Rect::NOTHING;
+
     let resp = row(
         ui,
         RowState::Default,
-        ("cmd", &cmd.id),
+        ("cmd", id),
         row_w,
         38.0,
         |ui, hovered| {
@@ -153,7 +226,11 @@ fn command_row(ui: &mut egui::Ui, cmd: &Command, row_w: f32) -> CommandRowRespon
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    widgets::truncating_text(ui, &cmd.cmd, theme::FG_0, 12.5);
+                    if renaming {
+                        commit_now = rename_edit(ui, state);
+                    } else {
+                        widgets::truncating_text(ui, &cmd.cmd, theme::FG_0, 12.5);
+                    }
                     let mut spans: Vec<(&str, egui::Color32)> = Vec::new();
                     if let Some(d) = &cmd.desc {
                         spans.push((d.as_str(), theme::FG_2));
@@ -169,19 +246,28 @@ fn command_row(ui: &mut egui::Ui, cmd: &Command, row_w: f32) -> CommandRowRespon
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if hovered {
+                if hovered && !renaming {
                     ui.label(egui::RichText::new("insert").size(10.0).color(theme::AMBER));
                 }
             });
         },
     );
 
-    // クリック位置が pin アイコン上なら pin トグル、それ以外は挿入。
-    let on_pin = resp
-        .interact_pointer_pos()
-        .is_some_and(|p| pin_rect.contains(p));
-    CommandRowResponse {
-        clicked_pin: resp.clicked() && on_pin,
-        clicked_insert: resp.clicked() && !on_pin,
+    if commit_now {
+        state.commit_rename();
+    } else if resp.double_clicked() && !renaming {
+        // ダブルクリックで cmd 文字列を inline 編集（編集中の再開始でバッファを潰さない）。
+        state.start_command_rename(id);
+    } else if resp.clicked() && !renaming {
+        // クリック位置が pin アイコン上なら pin トグル、それ以外は挿入。
+        let on_pin = resp
+            .interact_pointer_pos()
+            .is_some_and(|p| pin_rect.contains(p));
+        if on_pin {
+            state.toggle_command_pin(id);
+        } else {
+            let now = ui.input(|i| i.time);
+            state.insert_command(id, now);
+        }
     }
 }

@@ -3,10 +3,10 @@
 mod app;
 mod clock;
 mod config;
-// Phase 0/1 では未配線。Phase 2 で `app` から呼び出す。
-#[allow(dead_code)]
 mod pty;
+mod shell_integration;
 mod state;
+mod term;
 mod theme;
 mod ui;
 

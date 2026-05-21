@@ -311,3 +311,40 @@ pub enum RowState {
     Default,
     Active,
 }
+
+/// セクション見出し下のテキストボタン（"+ new session" / "★ add current folder" /
+/// "+ add command" 共通）。クリックで true。
+///
+/// 左右に余白を取り、`kbd_hint` の有無に関わらず同じ幅（パネル幅 - 左右余白）に固定する。
+const TEXT_BUTTON_PAD: f32 = 10.0;
+const TEXT_BUTTON_INNER_X: f32 = 8.0; // Frame inner_margin の水平片側
+
+pub fn text_button(ui: &mut egui::Ui, label: &str, kbd_hint: Option<&str>) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.add_space(TEXT_BUTTON_PAD);
+        let btn_w = (ui.available_width() - TEXT_BUTTON_PAD).max(40.0);
+        let resp = egui::Frame::none()
+            .stroke(egui::Stroke::new(1.0, theme::LINE_2))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(TEXT_BUTTON_INNER_X, 6.0))
+            .show(ui, |ui| {
+                ui.set_width(btn_w - TEXT_BUTTON_INNER_X * 2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label).size(12.0).color(theme::FG_1));
+                    if let Some(k) = kbd_hint {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            kbd(ui, k);
+                        });
+                    }
+                });
+            })
+            .response
+            .interact(egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        clicked = resp.clicked();
+    });
+    clicked
+}
