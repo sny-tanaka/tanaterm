@@ -359,7 +359,11 @@ impl AppState {
             (Some(i), d) if d < 0 => Some(i.saturating_sub(1)),
             (Some(i), _) => {
                 let next = i + 1;
-                if next >= n { None } else { Some(next) }
+                if next >= n {
+                    None
+                } else {
+                    Some(next)
+                }
             }
         };
         session.history_cursor = new_cursor;
@@ -372,7 +376,12 @@ impl AppState {
     /// 右 rail のコマンドをアクティブセッションの input_buffer に挿入する。
     /// 既存入力があっても上書きする（仕様: "insert" 挙動）。
     pub fn insert_command(&mut self, cmd_id: &str, now: f64) {
-        let Some(text) = self.commands.iter().find(|c| c.id == cmd_id).map(|c| c.cmd.clone()) else {
+        let Some(text) = self
+            .commands
+            .iter()
+            .find(|c| c.id == cmd_id)
+            .map(|c| c.cmd.clone())
+        else {
             return;
         };
         if let Some(session) = self.active_mut() {
@@ -527,7 +536,10 @@ mod seed {
                             span(OutputColor::Azure, "drwxr-xr-x"),
                             span(OutputColor::Dim, "   4 tanaka  staff   128 May 18 09:12 "),
                             span(OutputColor::Default, "..\n"),
-                            span(OutputColor::Dim, "-rw-r--r--   1 tanaka  staff  1234 May 21 13:58 "),
+                            span(
+                                OutputColor::Dim,
+                                "-rw-r--r--   1 tanaka  staff  1234 May 21 13:58 ",
+                            ),
                             span(OutputColor::Default, "Cargo.toml\n"),
                             span(OutputColor::Azure, "drwxr-xr-x"),
                             span(OutputColor::Dim, "   8 tanaka  staff   256 May 21 14:00 "),
@@ -541,7 +553,10 @@ mod seed {
                         time: "14:03".into(),
                         exit_code: Some(0),
                         output: vec![
-                            span(OutputColor::Dim, "> tanaterm@0.4.1 typecheck\n> tsc --noEmit\n\n"),
+                            span(
+                                OutputColor::Dim,
+                                "> tanaterm@0.4.1 typecheck\n> tsc --noEmit\n\n",
+                            ),
                             span(OutputColor::Sage, "✓ "),
                             span(OutputColor::Default, "0 errors  · 3.42s\n"),
                         ],
@@ -635,7 +650,14 @@ mod seed {
         vec![
             shelf_item("f1", "tanaterm", "~/work/tanaterm", "work", None, 142),
             shelf_item("f2", "api", "~/work/api", "work", None, 88),
-            shelf_item("f3", "frontend-lp", "~/work/mitsucari/frontend-lp", "work", None, 34),
+            shelf_item(
+                "f3",
+                "frontend-lp",
+                "~/work/mitsucari/frontend-lp",
+                "work",
+                None,
+                34,
+            ),
             shelf_item("f4", "dotfiles", "~/.config", "personal", None, 60),
             shelf_item("f5", "notes", "~/notes", "personal", None, 21),
             shelf_item("f6", "downloads", "~/Downloads", "personal", None, 7),
@@ -649,7 +671,14 @@ mod seed {
             // pinned
             command("c1", "df -h", "disk free by mount", true, 412, None),
             command("c2", "cd -", "previous directory", true, 88, None),
-            command("c3", "ps aux | grep $name", "find a process", true, 54, None),
+            command(
+                "c3",
+                "ps aux | grep $name",
+                "find a process",
+                true,
+                54,
+                None,
+            ),
             command("c4", "pnpm dev", "start dev server", true, 201, None),
             command(
                 "c5",
@@ -668,8 +697,22 @@ mod seed {
                 None,
             ),
             // recent
-            command("c10", "pnpm typecheck", "tsc --noEmit", false, 14, Some("2m")),
-            command("c11", "curl -I $url", "check response headers", false, 9, Some("6m")),
+            command(
+                "c10",
+                "pnpm typecheck",
+                "tsc --noEmit",
+                false,
+                14,
+                Some("2m"),
+            ),
+            command(
+                "c11",
+                "curl -I $url",
+                "check response headers",
+                false,
+                9,
+                Some("6m"),
+            ),
             command(
                 "c12",
                 "rg --hidden -g '!node_modules'",
@@ -686,10 +729,38 @@ mod seed {
                 3,
                 Some("22m"),
             ),
-            command("c14", "lsof -i :5173", "who's on the port", false, 2, Some("34m")),
-            command("c15", "tar -czf bundle.tgz dist/", "create gzip archive", false, 2, Some("1h")),
-            command("c16", "caffeinate -di", "keep mac awake", false, 1, Some("2h")),
-            command("c17", "history | tail -50", "last 50 history entries", false, 1, Some("3h")),
+            command(
+                "c14",
+                "lsof -i :5173",
+                "who's on the port",
+                false,
+                2,
+                Some("34m"),
+            ),
+            command(
+                "c15",
+                "tar -czf bundle.tgz dist/",
+                "create gzip archive",
+                false,
+                2,
+                Some("1h"),
+            ),
+            command(
+                "c16",
+                "caffeinate -di",
+                "keep mac awake",
+                false,
+                1,
+                Some("2h"),
+            ),
+            command(
+                "c17",
+                "history | tail -50",
+                "last 50 history entries",
+                false,
+                1,
+                Some("3h"),
+            ),
         ]
     }
 
@@ -775,7 +846,10 @@ mod tests {
         s.start_session_rename("s2");
         assert!(s.ui.rename_target.is_some());
         s.close_session("s2");
-        assert!(s.ui.rename_target.is_none(), "削除対象の rename は破棄される");
+        assert!(
+            s.ui.rename_target.is_none(),
+            "削除対象の rename は破棄される"
+        );
     }
 
     #[test]
@@ -823,7 +897,13 @@ mod tests {
     #[test]
     fn commit_rename_with_empty_buffer_is_noop_on_name() {
         let mut s = fresh();
-        let original = s.sessions.iter().find(|x| x.id == "s5").unwrap().name.clone();
+        let original = s
+            .sessions
+            .iter()
+            .find(|x| x.id == "s5")
+            .unwrap()
+            .name
+            .clone();
         s.start_session_rename("s5");
         s.ui.rename_buffer = "   ".into();
         s.commit_rename();

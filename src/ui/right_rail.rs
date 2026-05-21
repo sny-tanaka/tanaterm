@@ -127,47 +127,54 @@ struct CommandRowResponse {
 
 fn command_row(ui: &mut egui::Ui, cmd: &Command, row_w: f32) -> CommandRowResponse {
     let mut pin_rect = egui::Rect::NOTHING;
-    let resp = row(ui, RowState::Default, ("cmd", &cmd.id), row_w, 38.0, |ui, hovered| {
-        // 左: pin アイコン（pinned=amber / 非 pinned は hover で明るく）。
-        let pin_color = if cmd.pinned {
-            theme::AMBER
-        } else if hovered {
-            theme::FG_1
-        } else {
-            theme::FG_3
-        };
-        pin_rect = widgets::icon_image(ui, widgets::Icon::Pin, pin_color, 14.0);
-        ui.add_space(4.0);
+    let resp = row(
+        ui,
+        RowState::Default,
+        ("cmd", &cmd.id),
+        row_w,
+        38.0,
+        |ui, hovered| {
+            // 左: pin アイコン（pinned=amber / 非 pinned は hover で明るく）。
+            let pin_color = if cmd.pinned {
+                theme::AMBER
+            } else if hovered {
+                theme::FG_1
+            } else {
+                theme::FG_3
+            };
+            pin_rect = widgets::icon_image(ui, widgets::Icon::Pin, pin_color, 14.0);
+            ui.add_space(4.0);
 
-        // hover 時の "insert" ラベル分を右に確保し、meta 列をその残り幅に制限する。
-        let action_w = 48.0;
-        let meta_w = (ui.available_width() - action_w).max(40.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(meta_w, 30.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                widgets::truncating_text(ui, &cmd.cmd, theme::FG_0, 12.5);
-                let mut spans: Vec<(&str, egui::Color32)> = Vec::new();
-                if let Some(d) = &cmd.desc {
-                    spans.push((d.as_str(), theme::FG_2));
-                }
-                let when_label = cmd.when.as_ref().map(|w| format!("  ·  {w} ago"));
-                if let Some(wl) = &when_label {
-                    spans.push((wl.as_str(), theme::FG_2));
-                }
-                if !spans.is_empty() {
-                    widgets::truncating_line(ui, &spans, 10.5);
-                }
-            },
-        );
+            // hover 時の "insert" ラベル分を右に確保し、meta 列をその残り幅に制限する。
+            let action_w = 48.0;
+            let meta_w = (ui.available_width() - action_w).max(40.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(meta_w, 30.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    widgets::truncating_text(ui, &cmd.cmd, theme::FG_0, 12.5);
+                    let mut spans: Vec<(&str, egui::Color32)> = Vec::new();
+                    if let Some(d) = &cmd.desc {
+                        spans.push((d.as_str(), theme::FG_2));
+                    }
+                    let when_label = cmd.when.as_ref().map(|w| format!("  ·  {w} ago"));
+                    if let Some(wl) = &when_label {
+                        spans.push((wl.as_str(), theme::FG_2));
+                    }
+                    if !spans.is_empty() {
+                        widgets::truncating_line(ui, &spans, 10.5);
+                    }
+                },
+            );
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if hovered {
-                ui.label(egui::RichText::new("insert").size(10.0).color(theme::AMBER));
-            }
-        });
-    });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if hovered {
+                    ui.label(egui::RichText::new("insert").size(10.0).color(theme::AMBER));
+                }
+            });
+        },
+    );
 
     // クリック位置が pin アイコン上なら pin トグル、それ以外は挿入。
     let on_pin = resp

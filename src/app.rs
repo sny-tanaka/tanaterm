@@ -104,8 +104,7 @@ impl TanaTermApp {
 
         // rename 中に Esc が押されたら inline rename をキャンセルする
         // （session / shelf 共通のキャンセル経路をここに一本化している）。
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape))
-            && self.state.ui.rename_target.is_some()
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.state.ui.rename_target.is_some()
         {
             self.state.cancel_rename();
         }

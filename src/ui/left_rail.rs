@@ -133,58 +133,70 @@ fn session_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, active: bool, 
         )
     };
     let renaming = state.is_renaming_session(id);
-    let row_state = if active { RowState::Active } else { RowState::Default };
+    let row_state = if active {
+        RowState::Active
+    } else {
+        RowState::Default
+    };
 
     let mut commit_now = false;
     let mut close_rect = egui::Rect::NOTHING;
 
-    let resp = row(ui, row_state, ("session", id), row_w, 40.0, |ui, hovered| {
-        status_dot(ui, status, 8.0);
-        ui.add_space(4.0);
+    let resp = row(
+        ui,
+        row_state,
+        ("session", id),
+        row_w,
+        40.0,
+        |ui, hovered| {
+            status_dot(ui, status, 8.0);
+            ui.add_space(4.0);
 
-        let close_w = 22.0;
-        let meta_w = (ui.available_width() - close_w).max(40.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(meta_w, 32.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.horizontal(|ui| {
-                    if renaming {
-                        commit_now = rename_edit(ui, state);
-                    } else {
-                        let name_color = if active { theme::FG_0 } else { theme::FG_1 };
-                        if pinned {
-                            widgets::truncating_line(
-                                ui,
-                                &[(&name, name_color), ("  ⌖", theme::AMBER)],
-                                12.5,
-                            );
+            let close_w = 22.0;
+            let meta_w = (ui.available_width() - close_w).max(40.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(meta_w, 32.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.horizontal(|ui| {
+                        if renaming {
+                            commit_now = rename_edit(ui, state);
                         } else {
-                            widgets::truncating_text(ui, &name, name_color, 12.5);
+                            let name_color = if active { theme::FG_0 } else { theme::FG_1 };
+                            if pinned {
+                                widgets::truncating_line(
+                                    ui,
+                                    &[(&name, name_color), ("  ⌖", theme::AMBER)],
+                                    12.5,
+                                );
+                            } else {
+                                widgets::truncating_text(ui, &name, name_color, 12.5);
+                            }
                         }
-                    }
-                });
-                path_line(ui, &pwd, remote.as_deref());
-            },
-        );
+                    });
+                    path_line(ui, &pwd, remote.as_deref());
+                },
+            );
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-            close_rect = rect;
-            if hovered {
-                let over = ui.rect_contains_pointer(rect);
-                let color = if over { theme::RUST } else { theme::FG_2 };
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "×",
-                    egui::FontId::proportional(14.0),
-                    color,
-                );
-            }
-        });
-    });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                close_rect = rect;
+                if hovered {
+                    let over = ui.rect_contains_pointer(rect);
+                    let color = if over { theme::RUST } else { theme::FG_2 };
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        egui::FontId::proportional(14.0),
+                        color,
+                    );
+                }
+            });
+        },
+    );
 
     if commit_now {
         state.commit_rename();
@@ -233,38 +245,45 @@ fn shelf_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
     let mut commit_now = false;
     let mut edit_rect = egui::Rect::NOTHING;
 
-    let resp = row(ui, RowState::Default, ("shelf", id), row_w, 36.0, |ui, hovered| {
-        // 先頭の edit アイコン（クリックでラベル編集）。
-        let edit_color = if hovered { theme::FG_1 } else { theme::FG_3 };
-        edit_rect = widgets::icon_image(ui, Icon::Edit, edit_color, 13.0);
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new("📁").size(13.0).color(theme::AMBER));
-        ui.add_space(4.0);
+    let resp = row(
+        ui,
+        RowState::Default,
+        ("shelf", id),
+        row_w,
+        36.0,
+        |ui, hovered| {
+            // 先頭の edit アイコン（クリックでラベル編集）。
+            let edit_color = if hovered { theme::FG_1 } else { theme::FG_3 };
+            edit_rect = widgets::icon_image(ui, Icon::Edit, edit_color, 13.0);
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("📁").size(13.0).color(theme::AMBER));
+            ui.add_space(4.0);
 
-        let pill_w = 56.0;
-        let meta_w = (ui.available_width() - pill_w).max(40.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(meta_w, 30.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                if renaming {
-                    commit_now = rename_edit(ui, state);
-                } else {
-                    widgets::truncating_text(ui, &label, theme::FG_0, 12.0);
+            let pill_w = 56.0;
+            let meta_w = (ui.available_width() - pill_w).max(40.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(meta_w, 30.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    if renaming {
+                        commit_now = rename_edit(ui, state);
+                    } else {
+                        widgets::truncating_text(ui, &label, theme::FG_0, 12.0);
+                    }
+                    path_line(ui, &path, remote.as_deref());
+                },
+            );
+
+            // 右端: hover で "open ↵" を**テキストのみ**で表示（ボタン見た目は廃止）。
+            // クリックはデフォルトで open 挙動（行全体）なので装飾のみ。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if hovered && !renaming {
+                    ui.label(egui::RichText::new("open ↵").size(10.0).color(theme::AMBER));
                 }
-                path_line(ui, &path, remote.as_deref());
-            },
-        );
-
-        // 右端: hover で "open ↵" を**テキストのみ**で表示（ボタン見た目は廃止）。
-        // クリックはデフォルトで open 挙動（行全体）なので装飾のみ。
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if hovered && !renaming {
-                ui.label(egui::RichText::new("open ↵").size(10.0).color(theme::AMBER));
-            }
-        });
-    });
+            });
+        },
+    );
 
     if commit_now {
         state.commit_rename();

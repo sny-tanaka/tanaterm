@@ -115,11 +115,7 @@ fn empty_placeholder(ui: &mut egui::Ui, session: &Session) {
         |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(
-                    egui::RichText::new("棚")
-                        .size(72.0)
-                        .color(theme::AMBER),
-                );
+                ui.label(egui::RichText::new("棚").size(72.0).color(theme::AMBER));
                 ui.label(
                     egui::RichText::new(format!("empty session at {}", session.pwd))
                         .size(12.0)
@@ -279,8 +275,8 @@ fn input_meta(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label(egui::RichText::new("▶").color(theme::AMBER).size(11.0));
         ui.label(egui::RichText::new(pwd).color(theme::FG_1).size(11.0));
         // shell pill はクリックで zsh↔bash トグル（切替導線）。
-        let shell_resp = pill(ui, shell_label, false, true)
-            .on_hover_text("click to switch shell (zsh / bash)");
+        let shell_resp =
+            pill(ui, shell_label, false, true).on_hover_text("click to switch shell (zsh / bash)");
         if shell_resp.clicked() {
             state.toggle_shell();
         }
@@ -388,11 +384,7 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     kbd(ui, "↵");
-                    ui.label(
-                        egui::RichText::new("press")
-                            .color(theme::FG_3)
-                            .size(11.0),
-                    );
+                    ui.label(egui::RichText::new("press").color(theme::FG_3).size(11.0));
                 });
             });
         })
@@ -411,11 +403,8 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
             8.0,
             egui::Stroke::new(2.0, theme::AMBER_SOFT),
         );
-        ui.painter().rect_stroke(
-            frame_resp.rect,
-            8.0,
-            egui::Stroke::new(1.0, theme::AMBER),
-        );
+        ui.painter()
+            .rect_stroke(frame_resp.rect, 8.0, egui::Stroke::new(1.0, theme::AMBER));
     }
 
     if submit {

@@ -28,7 +28,8 @@ fn pulse_opacity(now: f64) -> f32 {
 /// `size` は dot 本体の直径。glow ありの場合（live）は半径 +3px の二重円。
 /// `busy` の場合は pulse でα値を変える＋次フレームへの repaint を仕込む。
 pub fn status_dot(ui: &mut egui::Ui, status: SessionStatus, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size + 6.0, size + 6.0), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(size + 6.0, size + 6.0), egui::Sense::hover());
     let center = rect.center();
     let painter = ui.painter();
     let now = ui.input(|i| i.time);
@@ -36,7 +37,8 @@ pub fn status_dot(ui: &mut egui::Ui, status: SessionStatus, size: f32) {
     let (fill, glow) = match status {
         SessionStatus::Live => (theme::SAGE, Some(theme::SAGE_SOFT)),
         SessionStatus::Busy => {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(40));
             let alpha = pulse_opacity(now);
             let mut c = theme::AMBER;
             c = egui::Color32::from_rgba_premultiplied(
@@ -213,7 +215,11 @@ pub fn row(
     }
 
     let inner = rect.shrink2(egui::vec2(8.0, 0.0));
-    let mut child = ui.child_ui(inner, egui::Layout::left_to_right(egui::Align::Center), None);
+    let mut child = ui.child_ui(
+        inner,
+        egui::Layout::left_to_right(egui::Align::Center),
+        None,
+    );
     add_contents(&mut child, row_hovered);
 
     // 子描画後に行全体へクリック interact を被せる（最前面なので確実に当たる）。
@@ -258,7 +264,11 @@ fn icon_texture_id(icon: Icon) -> egui::Id {
 /// app 起動時に 1 度だけ呼ぶ。失敗時は何もしない（描画側がグリフでフォールバック）。
 pub fn register_icons(ctx: &egui::Context) {
     register_one(ctx, Icon::Pin, include_bytes!("../../assets/icon/keep.png"));
-    register_one(ctx, Icon::Edit, include_bytes!("../../assets/icon/edit.png"));
+    register_one(
+        ctx,
+        Icon::Edit,
+        include_bytes!("../../assets/icon/edit.png"),
+    );
 }
 
 fn register_one(ctx: &egui::Context, icon: Icon, png: &[u8]) {
