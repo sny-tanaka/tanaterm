@@ -12,7 +12,7 @@ use eframe::egui;
 
 use crate::state::AppState;
 use crate::theme;
-use crate::ui::widgets::{self, kbd, row, status_dot, Icon, RowState};
+use crate::ui::widgets::{self, row, status_dot, text_button, Icon, RowState};
 
 /// inline rename の `TextEdit` 用固定 Id。`Esc` 検出と確定のため。
 pub fn rename_id() -> egui::Id {
@@ -60,43 +60,6 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     shelf_list(ui, state);
                 });
         });
-}
-
-/// SESSIONS / SHELF 見出し下のテキストボタン。クリックで true。
-/// 左右に 10px の余白を取り、kbd ヒストの有無に関わらず同じ幅（パネル幅 - 左右余白）に固定する。
-const TEXT_BUTTON_PAD: f32 = 10.0;
-const TEXT_BUTTON_INNER_X: f32 = 8.0; // Frame inner_margin の水平片側
-
-fn text_button(ui: &mut egui::Ui, label: &str, kbd_hint: Option<&str>) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.add_space(TEXT_BUTTON_PAD);
-        // ボタン外形の幅。右にも同じ余白を残す。
-        let btn_w = (ui.available_width() - TEXT_BUTTON_PAD).max(40.0);
-        let resp = egui::Frame::none()
-            .stroke(egui::Stroke::new(1.0, theme::LINE_2))
-            .rounding(6.0)
-            .inner_margin(egui::Margin::symmetric(TEXT_BUTTON_INNER_X, 6.0))
-            .show(ui, |ui| {
-                // Frame 内容幅を明示固定して、kbd ヒントの有無で幅が変わらないようにする。
-                ui.set_width(btn_w - TEXT_BUTTON_INNER_X * 2.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(label).size(12.0).color(theme::FG_1));
-                    if let Some(k) = kbd_hint {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            kbd(ui, k);
-                        });
-                    }
-                });
-            })
-            .response
-            .interact(egui::Sense::click());
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        clicked = resp.clicked();
-    });
-    clicked
 }
 
 fn sessions_list(ui: &mut egui::Ui, state: &mut AppState) {
@@ -307,7 +270,7 @@ fn shelf_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
 /// Esc によるキャンセルは `app.rs` の handle_shortcuts（update 冒頭で実行）が
 /// `rename_target` をクリアして一本化している。ここで Esc を見ないのは、
 /// TextEdit が Esc を consume して `lost_focus` 後の判定が commit に倒れるのを避けるため。
-fn rename_edit(ui: &mut egui::Ui, state: &mut AppState) -> bool {
+pub(crate) fn rename_edit(ui: &mut egui::Ui, state: &mut AppState) -> bool {
     let edit = egui::TextEdit::singleline(&mut state.ui.rename_buffer)
         .id(rename_id())
         .frame(false)
