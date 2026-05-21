@@ -8,6 +8,7 @@
 
 use eframe::egui;
 
+use crate::clock;
 use crate::state::{AppState, Command};
 use crate::theme;
 use crate::ui::left_rail::rename_edit;
@@ -68,11 +69,11 @@ enum Section {
 }
 
 impl Section {
-    /// セクションに属するか（pin 状態ベース）。
+    /// セクションに属するか。RECENT は「未 pin かつ実行履歴あり（last_used）」。
     fn contains(self, c: &Command) -> bool {
         match self {
             Section::Pinned => c.pinned,
-            Section::Recent => !c.pinned && c.when.is_some(),
+            Section::Recent => !c.pinned && c.last_used.is_some(),
         }
     }
 }
@@ -150,12 +151,18 @@ fn command_add(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
-    let ids: Vec<String> = state
+    let mut entries: Vec<(String, Option<u64>)> = state
         .commands
         .iter()
         .filter(|c| section.contains(c))
-        .map(|c| c.id.clone())
+        .map(|c| (c.id.clone(), c.last_used))
         .collect();
+    // RECENT は最終実行が新しい順に並べる（PINNED は登録順のまま）。
+    if section == Section::Recent {
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+    }
+    let ids: Vec<String> = entries.into_iter().map(|(id, _)| id).collect();
+    let now_secs = clock::now_unix();
 
     if ids.is_empty() {
         ui.horizontal(|ui| {
@@ -181,14 +188,28 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
             for id in ids {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    command_row(ui, state, &id, row_w);
+                    command_row(ui, state, &id, row_w, now_secs);
                 });
                 ui.add_space(2.0);
             }
         });
 }
 
-fn command_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
+/// `last_used`（Unix 秒）と現在時刻から "5m" / "2h" / "3d" / "now" の相対表記を作る。
+fn relative_time(last_used: u64, now_secs: u64) -> String {
+    let ago = now_secs.saturating_sub(last_used);
+    if ago < 60 {
+        "now".to_string()
+    } else if ago < 3600 {
+        format!("{}m", ago / 60)
+    } else if ago < 86400 {
+        format!("{}h", ago / 3600)
+    } else {
+        format!("{}d", ago / 86400)
+    }
+}
+
+fn command_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32, now_secs: u64) {
     let cmd: Command = {
         let Some(c) = state.commands.iter().find(|c| c.id == id) else {
             return;
@@ -235,7 +256,9 @@ fn command_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
                     if let Some(d) = &cmd.desc {
                         spans.push((d.as_str(), theme::FG_2));
                     }
-                    let when_label = cmd.when.as_ref().map(|w| format!("  ·  {w} ago"));
+                    let when_label = cmd
+                        .last_used
+                        .map(|t| format!("  ·  {} ago", relative_time(t, now_secs)));
                     if let Some(wl) = &when_label {
                         spans.push((wl.as_str(), theme::FG_2));
                     }

@@ -20,6 +20,14 @@ pub fn now_hhmm() -> String {
     format!("{hh:02}:{mm:02}")
 }
 
+/// 現在の Unix epoch 秒を返す（コマンドの最終実行時刻記録など、相対時間の算出に使う）。
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// 現在時刻を "HH:MM:SS" で返す（JST）。StatusBar 用。
 pub fn now_hhmmss() -> String {
     let secs = SystemTime::now()

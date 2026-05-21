@@ -207,6 +207,7 @@ fn shelf_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
 
     let mut commit_now = false;
     let mut edit_rect = egui::Rect::NOTHING;
+    let mut delete_rect = egui::Rect::NOTHING;
 
     let resp = row(
         ui,
@@ -222,8 +223,9 @@ fn shelf_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
             ui.label(egui::RichText::new("📁").size(13.0).color(theme::AMBER));
             ui.add_space(4.0);
 
-            let pill_w = 56.0;
-            let meta_w = (ui.available_width() - pill_w).max(40.0);
+            // 右端の delete × と "open ↵" 分の幅を確保し、meta 列をその残りに制限する。
+            let action_w = 80.0;
+            let meta_w = (ui.available_width() - action_w).max(40.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(meta_w, 30.0),
                 egui::Layout::top_down(egui::Align::Min),
@@ -238,10 +240,23 @@ fn shelf_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
                 },
             );
 
-            // 右端: hover で "open ↵" を**テキストのみ**で表示（ボタン見た目は廃止）。
-            // クリックはデフォルトで open 挙動（行全体）なので装飾のみ。
+            // 右端: hover で削除 × （最右）と "open ↵"。× はクリックで shelf 項目を削除。
+            // delete_rect は × が見えている（hover 中）時だけ有効にし、誤削除を防ぐ。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if hovered && !renaming {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    delete_rect = rect;
+                    let over = ui.rect_contains_pointer(rect);
+                    let color = if over { theme::RUST } else { theme::FG_2 };
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        egui::FontId::proportional(14.0),
+                        color,
+                    );
+                    ui.add_space(4.0);
                     ui.label(egui::RichText::new("open ↵").size(10.0).color(theme::AMBER));
                 }
             });
@@ -251,10 +266,14 @@ fn shelf_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
     if commit_now {
         state.commit_rename();
     } else if resp.clicked() && !renaming {
-        let on_edit = resp
-            .interact_pointer_pos()
-            .is_some_and(|p| edit_rect.contains(p));
-        if on_edit {
+        let pos = resp.interact_pointer_pos();
+        let on_edit = pos.is_some_and(|p| edit_rect.contains(p));
+        let on_delete = pos.is_some_and(|p| delete_rect.contains(p));
+        if on_delete {
+            state.remove_shelf(id);
+            let now = ui.input(|i| i.time);
+            state.show_toast(format!("Removed \"{label}\""), None, now);
+        } else if on_edit {
             state.start_shelf_rename(id);
         } else {
             state.new_session(label.clone(), path.clone());

@@ -131,10 +131,10 @@ pub struct Command {
     pub pinned: bool,
     #[serde(default)]
     pub uses: u32,
-    /// "2m", "1h" のような表示用文字列。
-    /// Phase 2 で `last_used_at: SystemTime` に差し替え予定。
+    /// 最終実行時刻（Unix epoch 秒）。実行されたコマンドだけが `Some` になり、
+    /// RECENT セクションの対象＆並び順（新しい順）に使う。表示の "Xm ago" はここから算出。
     #[serde(default)]
-    pub when: Option<String>,
+    pub last_used: Option<u64>,
 }
 
 /// inline rename / inline 編集の対象（セッション名 / shelf ラベル / command 文字列）。
@@ -624,6 +624,53 @@ impl AppState {
             id,
             bytes: format!("{cmd}\n").into_bytes(),
         });
+        self.record_recent_command(&cmd, crate::clock::now_unix());
+    }
+
+    /// 実行されたコマンドを RECENT に記録する。同じ cmd が既にあれば（pinned 含め）
+    /// `last_used` を更新し、無ければ未 pin の recent エントリを足す。RECENT は上限 `MAX_RECENT`
+    /// 件に保ち、超えたら最も古い未 pin エントリを捨てる。
+    fn record_recent_command(&mut self, cmd: &str, now_secs: u64) {
+        const MAX_RECENT: usize = 30;
+        if let Some(c) = self.commands.iter_mut().find(|c| c.cmd == cmd) {
+            c.last_used = Some(now_secs);
+            c.uses = c.uses.saturating_add(1);
+            return;
+        }
+        let id = self.fresh_id("c");
+        self.commands.push(Command {
+            id,
+            cmd: cmd.to_string(),
+            desc: None,
+            pinned: false,
+            uses: 1,
+            last_used: Some(now_secs),
+        });
+        // RECENT（未 pin かつ last_used あり）が上限を超えたら最古を 1 件捨てる。
+        let recent = self
+            .commands
+            .iter()
+            .filter(|c| !c.pinned && c.last_used.is_some())
+            .count();
+        if recent > MAX_RECENT {
+            if let Some((idx, _)) = self
+                .commands
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.pinned && c.last_used.is_some())
+                .min_by_key(|(_, c)| c.last_used)
+            {
+                self.commands.remove(idx);
+            }
+        }
+    }
+
+    /// shelf 項目を削除する。rename 中ならキャンセルしてから削除する。
+    pub fn remove_shelf(&mut self, id: &str) {
+        if self.is_renaming_shelf(id) {
+            self.cancel_rename();
+        }
+        self.shelf.retain(|s| s.id != id);
     }
 
     /// 指定セッションの末尾の実行中ブロックへの可変参照。
@@ -878,7 +925,7 @@ impl AppState {
             desc: (!desc.is_empty()).then_some(desc),
             pinned: true,
             uses: 0,
-            when: None,
+            last_used: None,
         });
     }
 
@@ -1147,101 +1194,15 @@ mod seed {
         ]
     }
 
+    /// 既定の PINNED コマンド。RECENT は実行履歴から動的に埋まるので seed では空。
     pub(super) fn commands() -> Vec<Command> {
         vec![
-            // pinned
-            command("c1", "df -h", "disk free by mount", true, 412, None),
-            command("c2", "cd -", "previous directory", true, 88, None),
-            command(
-                "c3",
-                "ps aux | grep $name",
-                "find a process",
-                true,
-                54,
-                None,
-            ),
-            command("c4", "pnpm dev", "start dev server", true, 201, None),
-            command(
-                "c5",
-                "docker compose logs -f $svc",
-                "tail service logs",
-                true,
-                73,
-                None,
-            ),
-            command(
-                "c6",
-                "kubectl get pods -A",
-                "all pods, all namespaces",
-                true,
-                32,
-                None,
-            ),
-            // recent
-            command(
-                "c10",
-                "pnpm typecheck",
-                "tsc --noEmit",
-                false,
-                14,
-                Some("2m"),
-            ),
-            command(
-                "c11",
-                "curl -I $url",
-                "check response headers",
-                false,
-                9,
-                Some("6m"),
-            ),
-            command(
-                "c12",
-                "rg --hidden -g '!node_modules'",
-                "ripgrep, skip node_modules",
-                false,
-                5,
-                Some("11m"),
-            ),
-            command(
-                "c13",
-                "find . -name '*.tsx' | xargs wc -l",
-                "line count, all tsx",
-                false,
-                3,
-                Some("22m"),
-            ),
-            command(
-                "c14",
-                "lsof -i :5173",
-                "who's on the port",
-                false,
-                2,
-                Some("34m"),
-            ),
-            command(
-                "c15",
-                "tar -czf bundle.tgz dist/",
-                "create gzip archive",
-                false,
-                2,
-                Some("1h"),
-            ),
-            command(
-                "c16",
-                "caffeinate -di",
-                "keep mac awake",
-                false,
-                1,
-                Some("2h"),
-            ),
-            command(
-                "c17",
-                "history | tail -50",
-                "last 50 history entries",
-                false,
-                1,
-                Some("3h"),
-            ),
+            command("c1", "df -h", "disk free by mount", 412),
+            command("c2", "cd -", "previous directory", 88),
+            command("c3", "ps aux | grep $name", "find a process", 54),
+            command("c4", "pnpm dev", "start dev server", 201),
+            command("c5", "docker compose logs -f $svc", "tail service logs", 73),
+            command("c6", "kubectl get pods -A", "all pods, all namespaces", 32),
         ]
     }
 
@@ -1271,21 +1232,15 @@ mod seed {
         }
     }
 
-    fn command(
-        id: &str,
-        cmd: &str,
-        desc: &str,
-        pinned: bool,
-        uses: u32,
-        when: Option<&str>,
-    ) -> Command {
+    /// 既定の PINNED コマンド 1 件（pinned=true, last_used=None）。
+    fn command(id: &str, cmd: &str, desc: &str, uses: u32) -> Command {
         Command {
             id: id.into(),
             cmd: cmd.into(),
             desc: Some(desc.into()),
-            pinned,
+            pinned: true,
             uses,
-            when: when.map(str::to_string),
+            last_used: None,
         }
     }
 }
@@ -1534,6 +1489,89 @@ mod tests {
     }
 
     #[test]
+    fn record_recent_command_adds_and_dedups() {
+        let mut s = fresh();
+        let pinned_before = s.commands.iter().filter(|c| c.pinned).count();
+        s.record_recent_command("npm test", 1000);
+        let recent: Vec<&Command> = s
+            .commands
+            .iter()
+            .filter(|c| !c.pinned && c.last_used.is_some())
+            .collect();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].cmd, "npm test");
+        assert_eq!(recent[0].last_used, Some(1000));
+
+        // 同じ cmd を再実行すると新規追加せず last_used を更新する。
+        s.record_recent_command("npm test", 2000);
+        let recent_after = s
+            .commands
+            .iter()
+            .filter(|c| !c.pinned && c.last_used.is_some())
+            .count();
+        assert_eq!(recent_after, 1, "重複は作らない");
+        let c = s.commands.iter().find(|c| c.cmd == "npm test").unwrap();
+        assert_eq!(c.last_used, Some(2000));
+        assert_eq!(c.uses, 2);
+        // pinned 件数は変わらない。
+        assert_eq!(
+            s.commands.iter().filter(|c| c.pinned).count(),
+            pinned_before
+        );
+    }
+
+    #[test]
+    fn record_recent_command_bumps_existing_pinned() {
+        let mut s = fresh();
+        // seed の pinned コマンド "df -h" を実行 → 新規 recent は作らず last_used 更新。
+        let recent_before = s.commands.iter().filter(|c| !c.pinned).count();
+        s.record_recent_command("df -h", 5000);
+        assert_eq!(
+            s.commands.iter().filter(|c| !c.pinned).count(),
+            recent_before
+        );
+        let c = s.commands.iter().find(|c| c.cmd == "df -h").unwrap();
+        assert!(c.pinned, "pinned のまま");
+        assert_eq!(c.last_used, Some(5000));
+    }
+
+    #[test]
+    fn submit_input_records_recent_command() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "echo hi".into();
+        }
+        s.submit_input("12:00".into());
+        assert!(
+            s.commands.iter().any(|c| c.cmd == "echo hi" && !c.pinned),
+            "実行コマンドが recent に記録される"
+        );
+    }
+
+    #[test]
+    fn remove_shelf_deletes_item() {
+        let mut s = fresh();
+        let before = s.shelf.len();
+        assert!(s.shelf.iter().any(|x| x.id == "f1"));
+        s.remove_shelf("f1");
+        assert_eq!(s.shelf.len(), before - 1);
+        assert!(!s.shelf.iter().any(|x| x.id == "f1"));
+    }
+
+    #[test]
+    fn remove_shelf_cancels_rename_for_removed_item() {
+        let mut s = fresh();
+        s.start_shelf_rename("f1");
+        assert!(s.ui.rename_target.is_some());
+        s.remove_shelf("f1");
+        assert!(
+            s.ui.rename_target.is_none(),
+            "削除対象の rename は破棄される"
+        );
+    }
+
+    #[test]
     fn commit_command_add_appends_pinned_command() {
         let mut s = fresh();
         s.start_command_add();
@@ -1589,13 +1627,8 @@ mod tests {
         s.focus_session("s2");
         s.ui.rail_left_visible = false;
         s.ui.shell = crate::config::Shell::Bash;
-        // seed では c1 が pin 済み・c10 が未 pin。状態を反転させて往復を確認。
+        // seed は c1..c6 が pin 済み。c1 を未 pin に倒して往復を確認（c2 は pin 維持）。
         s.commands.iter_mut().find(|c| c.id == "c1").unwrap().pinned = false;
-        s.commands
-            .iter_mut()
-            .find(|c| c.id == "c10")
-            .unwrap()
-            .pinned = true;
 
         let restored = AppState::from_persistent(s.to_persistent());
 
@@ -1617,7 +1650,7 @@ mod tests {
             restored
                 .commands
                 .iter()
-                .find(|c| c.id == "c10")
+                .find(|c| c.id == "c2")
                 .unwrap()
                 .pinned
         );
