@@ -1,15 +1,15 @@
 //! TopBar (`grid-area: top`, 40px)。
 //!
-//! 仕様: ブランド / レール toggle / breadcrumb / グローバル検索 / 右 cluster。
+//! 仕様: ブランド / レール toggle / breadcrumb / グローバル検索。
 //! - 信号機（traffic lights）は egui ではネイティブ chrome に任せるので描かない
 //! - テーマ toggle (sun) は warm-dark 固定なので非表示
-//! - AI / 設定 / More はスタブボタン（クリックで toast を出すのみ）
+//! - AI / 設定 / More のスタブボタンは未配線のため削除済み（必要時に復活）
 
 use eframe::egui;
 
 use crate::state::AppState;
 use crate::theme;
-use crate::ui::widgets::{self, icon_button};
+use crate::ui::widgets::{self, sidebar_toggle_button, SidebarSide};
 
 /// `ctx.memory_mut(|m| m.request_focus(SEARCH_ID))` で ⌘K から focus する。
 pub fn search_id() -> egui::Id {
@@ -37,15 +37,13 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
 }
 
 fn brand(ui: &mut egui::Ui) {
-    // 18x18 amber rounded-square + 棚 in dark.
+    // 18x18 amber 角丸 + 棚（shelf）を表す横線 2 本。漢字 "棚" は egui デフォルト
+    // フォントに無く豆腐になるため、painter で shelf 形を直接描く。
     let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, theme::AMBER);
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "棚",
-        egui::FontId::proportional(12.0),
+    widgets::paint_brand_mark(
+        ui.painter(),
+        rect,
+        theme::AMBER,
         egui::Color32::from_rgb(0x1a, 0x12, 0x0a),
     );
     ui.label(
@@ -62,10 +60,10 @@ fn brand(ui: &mut egui::Ui) {
 }
 
 fn rail_toggles(ui: &mut egui::Ui, state: &mut AppState) {
-    if icon_button(ui, "⟦", state.ui.rail_left_visible).clicked() {
+    if sidebar_toggle_button(ui, SidebarSide::Left, state.ui.rail_left_visible).clicked() {
         state.ui.rail_left_visible = !state.ui.rail_left_visible;
     }
-    if icon_button(ui, "⟧", state.ui.rail_right_visible).clicked() {
+    if sidebar_toggle_button(ui, SidebarSide::Right, state.ui.rail_right_visible).clicked() {
         state.ui.rail_right_visible = !state.ui.rail_right_visible;
     }
 }
@@ -93,30 +91,22 @@ fn breadcrumb(ui: &mut egui::Ui, state: &AppState) {
 }
 
 fn center_and_right(ui: &mut egui::Ui, state: &mut AppState) {
-    // 右クラスタを先に置きたいので、まず仮想的に右寄せ → 残った中央領域を search に。
-    let right_cluster_w = 28.0 * 3.0 + 4.0 * 2.0;
+    // search を残り領域の中央に配置する。
+    //
+    // この時点の `avail` は brand / rail_toggles / breadcrumb 消費後の残余幅。
+    // 配置順: add_space(pad) [sp] search [sp] add_space(pad)
+    //   avail = 2*pad + search_w + 2*spacing
+    //
+    // 幅が狭く pad=0 に丸められる場合でも add_space 前後の item_spacing は残るので、
+    // search は spacing 分の余白を両側に持って中央に収まる（左寄せにはならない）。
+    let spacing = ui.spacing().item_spacing.x;
     let avail = ui.available_width();
-    let target_search_w = avail.min(520.0 + right_cluster_w);
-    let search_w = (target_search_w - right_cluster_w).max(120.0);
-    let pad = ((avail - search_w - right_cluster_w) / 2.0).max(0.0);
+    let search_w = (avail - 2.0 * spacing).clamp(120.0, 520.0);
+    let pad = ((avail - search_w - 2.0 * spacing) / 2.0).max(0.0);
 
     ui.add_space(pad);
     search_input(ui, state, search_w);
     ui.add_space(pad);
-
-    // 右クラスタ。
-    if icon_button(ui, "AI", false).clicked() {
-        let now = ui.input(|i| i.time);
-        state.show_toast("AI ask is a stub for now", None, now);
-    }
-    if icon_button(ui, "⚙", false).clicked() {
-        let now = ui.input(|i| i.time);
-        state.show_toast("Preferences not wired yet", None, now);
-    }
-    if icon_button(ui, "⋯", false).clicked() {
-        let now = ui.input(|i| i.time);
-        state.show_toast("More menu is a stub", None, now);
-    }
 }
 
 fn search_input(ui: &mut egui::Ui, state: &mut AppState, width: f32) {

@@ -135,7 +135,9 @@ fn command_add(ui: &mut egui::Ui, state: &mut AppState) {
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("↵ add").size(10.0).color(theme::AMBER));
+                    // 左→右レイアウト: ↵ → "add" の順で追加すれば視覚的に「↵ add」になる。
+                    widgets::return_arrow_inline(ui, theme::AMBER);
+                    ui.label(egui::RichText::new("add").size(10.0).color(theme::AMBER));
                     ui.label(
                         egui::RichText::new("· esc cancel")
                             .size(10.0)
