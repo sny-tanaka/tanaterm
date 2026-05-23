@@ -127,14 +127,28 @@ fn session_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, active: bool, 
                             commit_now = rename_edit(ui, state);
                         } else {
                             let name_color = if active { theme::FG_0 } else { theme::FG_1 };
-                            if pinned {
-                                widgets::truncating_line(
-                                    ui,
-                                    &[(&name, name_color), ("  ⌖", theme::AMBER)],
-                                    12.5,
-                                );
+                            // pinned 時は名前の右に amber 小ドットを描く。
+                            // 漢字 ⌖ (U+2316) は egui デフォルトフォントに無く豆腐になるため。
+                            // 幅基準は外側 allocate_ui_with_layout で確定済みの meta_w を使う
+                            // （`ui.available_width()` だと内側 spacing 等で揺らぐ可能性がある）。
+                            // pinned 時のみ name と marker の間に item_spacing が入るので
+                            // 同条件で差し引く。
+                            let (marker_w, name_max) = if pinned {
+                                let m = 12.0;
+                                let sp = ui.spacing().item_spacing.x;
+                                (m, (meta_w - m - sp).max(20.0))
                             } else {
+                                (0.0, meta_w.max(20.0))
+                            };
+                            ui.allocate_ui(egui::vec2(name_max, 16.0), |ui| {
                                 widgets::truncating_text(ui, &name, name_color, 12.5);
+                            });
+                            if pinned {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(marker_w, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 3.0, theme::AMBER);
                             }
                         }
                     });
@@ -257,7 +271,10 @@ fn shelf_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, row_w: f32) {
                         color,
                     );
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("open ↵").size(10.0).color(theme::AMBER));
+                    // right_to_left レイアウト内: 最初に追加した方が右に来る。
+                    // ↵ を先に置いて「open ↵」の並び（左→右）を再現する。
+                    widgets::return_arrow_inline(ui, theme::AMBER);
+                    ui.label(egui::RichText::new("open").size(10.0).color(theme::AMBER));
                 }
             });
         },

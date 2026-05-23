@@ -4,6 +4,10 @@
 //! - `kbd`: ⌘ や ↵ を入れる小さなボックス。
 //! - `section_header` / `section_header_plain`: rail セクションの大文字ヘッダ。
 //! - `icon_button`: 28x28 の枠付きボタン。
+//! - `sidebar_toggle_button`: TopBar のレール toggle 用、角丸枠＋縦線を painter で直接描く 28x28 ボタン。
+//! - `paint_brand_mark`: 棚（shelf）ブランドマーク。amber 角丸＋濃い横線 2 本を painter で描く。
+//! - `paint_return_arrow`: ↵ Enter アイコン。縦線＋横線＋矢じりを painter で描く。
+//! - `kbd_return`: `kbd("↵")` の painter 版。Unicode グリフ非対応フォント対策。
 //! - `icon_image`: keep.png / edit.png を tint して描く SVG 由来アイコン。
 //! - `row`: rail 行の共通枠（hover / active で背景を切替・全面クリック）。
 //!
@@ -99,7 +103,7 @@ pub fn truncating_text(ui: &mut egui::Ui, text: &str, color: egui::Color32, size
     truncating_line(ui, &[(text, color)], size);
 }
 
-/// kbd 風の小バッジ。`⌘K` / `↵` などに使う。
+/// kbd 風の小バッジ。`⌘K` などに使う。
 pub fn kbd(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let text = egui::RichText::new(label).size(10.0).color(theme::FG_1);
     egui::Frame::none()
@@ -109,6 +113,102 @@ pub fn kbd(ui: &mut egui::Ui, label: &str) -> egui::Response {
         .inner_margin(egui::Margin::symmetric(4.0, 1.0))
         .show(ui, |ui| ui.label(text))
         .response
+}
+
+/// `↵` の代わりに return-arrow を painter で描く kbd 風バッジ。
+/// egui デフォルトフォントが U+21B5 を持たないため、`kbd(ui, "↵")` だと豆腐になる。
+pub fn kbd_return(ui: &mut egui::Ui) -> egui::Response {
+    egui::Frame::none()
+        .fill(theme::BG_2)
+        .stroke(egui::Stroke::new(1.0, theme::LINE))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(4.0, 1.0))
+        .show(ui, |ui| {
+            // kbd の他文字（"⌘K" 等）に高さを揃える: size 10 のテキストとほぼ同じ縦寸。
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
+            paint_return_arrow(ui.painter(), rect, theme::FG_1);
+        })
+        .response
+}
+
+/// inline ラベル（"open ↵" 等）の代わりに使う小さな return-arrow。
+/// 11x11 をその場に allocate して painter で描く。色は呼び出し側で指定。
+pub fn return_arrow_inline(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
+    paint_return_arrow(ui.painter(), rect, color);
+}
+
+/// `↵` Enter シンボルを `rect` 内に painter で描く。
+///
+/// 形状: 右上から下に短い縦線 → 中央水平に左へ伸びる横線 → 左端に矢じり。
+/// stroke 太さは rect 高さに比例して決め、kbd サイズ〜empty placeholder サイズまでスケールさせる。
+pub fn paint_return_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke_w = (rect.height() * 0.14).clamp(1.0, 3.0);
+    let stroke = egui::Stroke::new(stroke_w, color);
+    let top = rect.top() + rect.height() * 0.18;
+    let mid_y = rect.center().y + rect.height() * 0.08;
+    let right_x = rect.right() - rect.width() * 0.10;
+    let left_x = rect.left() + rect.width() * 0.18;
+
+    painter.line_segment(
+        [
+            egui::pos2(right_x, top),
+            egui::pos2(right_x, mid_y + stroke_w * 0.5),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(right_x, mid_y), egui::pos2(left_x, mid_y)],
+        stroke,
+    );
+    let head = rect.width() * 0.18;
+    painter.line_segment(
+        [
+            egui::pos2(left_x, mid_y),
+            egui::pos2(left_x + head, mid_y - head),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(left_x, mid_y),
+            egui::pos2(left_x + head, mid_y + head),
+        ],
+        stroke,
+    );
+}
+
+/// 棚（shelf）ブランドマークを `rect` 内に painter で描く。
+///
+/// 形状: `fill` で塗った角丸正方形に `line` 色の水平線 2 本（棚の段を表現）。
+/// 漢字「棚」が egui デフォルトフォントに無い対策で、12px の TopBar ブランドから
+/// 56px の empty placeholder まで同じ形状でスケールする。
+pub fn paint_brand_mark(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    fill: egui::Color32,
+    line: egui::Color32,
+) {
+    painter.rect_filled(rect, rect.width() * 0.22, fill);
+    let inset = rect.width() * 0.22;
+    let stroke_w = (rect.width() * 0.085).max(1.2);
+    let stroke = egui::Stroke::new(stroke_w, line);
+    let y_top = rect.top() + rect.height() * 0.38;
+    let y_bot = rect.top() + rect.height() * 0.66;
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset, y_top),
+            egui::pos2(rect.right() - inset, y_top),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset, y_bot),
+            egui::pos2(rect.right() - inset, y_bot),
+        ],
+        stroke,
+    );
 }
 
 /// rail のセクション見出し（"SESSIONS  5" 等）。
@@ -162,6 +262,52 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, on: bool) -> egui::Response {
         glyph,
         egui::FontId::proportional(13.0),
         fg,
+    );
+    resp
+}
+
+/// サイドバー toggle アイコンの向き。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarSide {
+    Left,
+    Right,
+}
+
+/// 28x28 のサイドバー toggle ボタン。デザインの `Icon.sidebarL` / `sidebarR`
+/// （角丸矩形＋片側寄りの縦線）を painter で直接描く。
+/// Unicode グリフは egui デフォルトフォントに無いため四角化するのを避ける目的。
+pub fn sidebar_toggle_button(ui: &mut egui::Ui, side: SidebarSide, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    let (bg, fg) = if on {
+        (theme::AMBER_SOFT, theme::AMBER)
+    } else if resp.hovered() {
+        (theme::BG_2, theme::FG_0)
+    } else {
+        (egui::Color32::TRANSPARENT, theme::FG_1)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, bg);
+
+    // デザイン viewBox は 16x16。中の枠は (1.5,2.5)-(14.5,13.5) = 13x11、
+    // 縦線は sidebarL なら x=5.5、sidebarR なら x=10.5（viewBox 中心 8 からの ±2.5）。
+    // 14px 表示にスケール（14/16 = 0.875）。
+    let s = 14.0 / 16.0;
+    let center = rect.center();
+    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(13.0 * s, 11.0 * s));
+    let stroke = egui::Stroke::new(1.4, fg);
+    painter.rect_stroke(icon_rect, 1.5 * s, stroke);
+
+    let line_dx = match side {
+        SidebarSide::Left => -2.5 * s,
+        SidebarSide::Right => 2.5 * s,
+    };
+    let line_x = center.x + line_dx;
+    painter.line_segment(
+        [
+            egui::pos2(line_x, icon_rect.top()),
+            egui::pos2(line_x, icon_rect.bottom()),
+        ],
+        stroke,
     );
     resp
 }

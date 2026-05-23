@@ -7,7 +7,7 @@ use eframe::egui;
 use crate::clock;
 use crate::state::{AppState, Block, OutputColor, OutputSpan, Session};
 use crate::theme;
-use crate::ui::widgets::{self, kbd, status_dot};
+use crate::ui::widgets::{self, status_dot};
 
 pub fn input_id() -> egui::Id {
     egui::Id::new("tanaterm.central.input")
@@ -115,7 +115,16 @@ fn empty_placeholder(ui: &mut egui::Ui, session: &Session) {
         |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(egui::RichText::new("棚").size(72.0).color(theme::AMBER));
+                // 漢字 "棚" の代わりに painter で shelf マークを描く（TopBar ブランドと同形）。
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+                widgets::paint_brand_mark(
+                    ui.painter(),
+                    rect,
+                    theme::AMBER,
+                    egui::Color32::from_rgb(0x1a, 0x12, 0x0a),
+                );
+                ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(format!("empty session at {}", session.pwd))
                         .size(12.0)
@@ -390,7 +399,7 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    kbd(ui, "↵");
+                    widgets::kbd_return(ui);
                     ui.label(egui::RichText::new("press").color(theme::FG_3).size(11.0));
                 });
             });
