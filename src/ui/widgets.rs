@@ -18,10 +18,10 @@ use eframe::egui;
 use crate::state::SessionStatus;
 use crate::theme;
 
-const BUSY_PULSE_PERIOD: f64 = 1.2;
+pub const BUSY_PULSE_PERIOD: f64 = 1.2;
 
 /// CSS `.pulse 1.2s infinite` を近似した opacity 波形 (0.35..1.0)。
-fn pulse_opacity(now: f64) -> f32 {
+pub fn pulse_opacity(now: f64) -> f32 {
     let t = (now % BUSY_PULSE_PERIOD) / BUSY_PULSE_PERIOD;
     let cos = (t * std::f64::consts::TAU).cos();
     (0.35 + 0.325 * (1.0 + cos)) as f32
@@ -43,15 +43,9 @@ pub fn status_dot(ui: &mut egui::Ui, status: SessionStatus, size: f32) {
         SessionStatus::Busy => {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(40));
-            let alpha = pulse_opacity(now);
-            let mut c = theme::AMBER;
-            c = egui::Color32::from_rgba_premultiplied(
-                (c.r() as f32 * alpha) as u8,
-                (c.g() as f32 * alpha) as u8,
-                (c.b() as f32 * alpha) as u8,
-                (255.0 * alpha) as u8,
-            );
-            (c, None)
+            // egui に gamma 補正込みで multiply してもらう。手動で `from_rgba_premultiplied`
+            // を組むと RGB と alpha の比率がずれる（特に色値が 255 から離れている時）。
+            (theme::AMBER.gamma_multiply(pulse_opacity(now)), None)
         }
         SessionStatus::Err => (theme::RUST, None),
         SessionStatus::Idle => (theme::FG_3, None),
