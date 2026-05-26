@@ -34,6 +34,11 @@ pub struct Block {
     pub pwd: String,
     /// 表示用の時刻文字列 ("14:02" 等)。
     pub time: String,
+    /// コマンド送信時の Unix epoch 秒。`running` 中の経過時間表示に使う。
+    /// 既存データには無いフィールドなので、deserialize 時は 0 になる（UI 側で
+    /// saturating_sub するため "0" でも経過秒数が壊れない）。
+    #[serde(default)]
+    pub started_at_unix: u64,
     /// 出力取り込み中（amber border + Busy）。OSC 133 の C〜D 間、または heuristic で
     /// 次コマンド送信までが `true`。
     #[serde(default)]
@@ -152,8 +157,10 @@ pub enum RenameTarget {
 pub enum PendingPty {
     /// 新規セッションのシェルを起動する。`cwd` は表示パス（`~/work/foo` 等）。
     Spawn { id: String, cwd: String },
-    /// セッションへバイト列（コマンド / キー入力）を送る。
+    /// 入力行から確定したユーザコマンドを送る。`on_submit()`（SGR リセット + 出力取り込み開始）を伴う。
     Send { id: String, bytes: Vec<u8> },
+    /// 制御文字等の生バイトを実行中シェルへ転送する。`on_submit()` は呼ばない。
+    SendRaw { id: String, bytes: Vec<u8> },
     /// セッションのシェルを終了する。
     Close { id: String },
 }
@@ -583,6 +590,40 @@ impl AppState {
         self.pending.push(PendingPty::Close { id: id.to_string() });
     }
 
+    /// アクティブセッションに生バイト列を `PendingPty::SendRaw` として積む。
+    ///
+    /// Ctrl+C(0x03) などの制御文字を実行中シェルへ転送する用途。`Send` と違い
+    /// `on_submit()`（SGR リセット・出力取り込み開始）は発火しない。
+    /// アクティブセッションがない / `bytes` が空の場合は何もしない。
+    pub fn push_pty_send_raw(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(id) = self.ui.active_session_id.clone() else {
+            return;
+        };
+        self.pending.push(PendingPty::SendRaw { id, bytes });
+    }
+
+    /// アクティブセッションの input_buffer を、実行中プロセスの stdin として
+    /// 改行付きでそのまま転送する。`submit_input` と違い:
+    /// - 新規ブロックを積まない / `running` 状態を変えない
+    /// - `on_submit()`（SGR リセット）を呼ばない
+    /// - 空 input でも `\n` だけは送る（シェルでの空 Enter と同等）
+    ///
+    /// 呼び出し元は busy（直近ブロックが `running`）を確認した上で呼ぶ前提。
+    /// idle 中に呼ぶと裸の `\n` が PTY に流れて UI と PTY 状態がずれるため、
+    /// 公開範囲を crate 内に絞っている。
+    pub(crate) fn submit_input_as_stdin(&mut self) {
+        let Some(session) = self.active_mut() else {
+            return;
+        };
+        let buf = std::mem::take(&mut session.input_buffer);
+        let mut bytes = buf.into_bytes();
+        bytes.push(b'\n');
+        self.push_pty_send_raw(bytes);
+    }
+
     /// アクティブセッションの input_buffer を 1 コマンドとして実 PTY に送る。
     ///
     /// 空入力は無視。実行中ブロック（`running` = true, exit 未確定）を作って末尾に積み、
@@ -615,6 +656,7 @@ impl AppState {
             cmd: cmd.clone(),
             pwd,
             time: now_hhmm,
+            started_at_unix: crate::clock::now_unix(),
             running: true,
             exit_code: None,
             output: Vec::new(),
@@ -1046,6 +1088,7 @@ mod seed {
                         cmd: "ls -la".into(),
                         pwd: "~/work/tanaterm".into(),
                         time: "14:02".into(),
+                        started_at_unix: 0,
                         running: false,
                         exit_code: Some(0),
                         output: vec![
@@ -1071,6 +1114,7 @@ mod seed {
                         cmd: "pnpm typecheck".into(),
                         pwd: "~/work/tanaterm".into(),
                         time: "14:03".into(),
+                        started_at_unix: 0,
                         running: false,
                         exit_code: Some(0),
                         output: vec![
@@ -1087,6 +1131,7 @@ mod seed {
                         cmd: "pnpm dev".into(),
                         pwd: "~/work/tanaterm".into(),
                         time: "14:04".into(),
+                        started_at_unix: crate::clock::now_unix(),
                         // 実行中。
                         running: true,
                         exit_code: None,
@@ -1120,6 +1165,7 @@ mod seed {
                     cmd: "docker compose logs -f api".into(),
                     pwd: "~/work/api".into(),
                     time: "13:48".into(),
+                    started_at_unix: crate::clock::now_unix(),
                     running: true,
                     exit_code: None,
                     output: vec![span(OutputColor::Dim, "Streaming logs…")],
@@ -1365,6 +1411,78 @@ mod tests {
         assert_eq!(s.active().unwrap().history, vec!["ls".to_string()]);
         // ブロックは 2 つ追加される。
         assert_eq!(s.active().unwrap().blocks.len(), 2);
+    }
+
+    #[test]
+    fn push_pty_send_raw_queues_bytes_to_active_session() {
+        let mut s = fresh();
+        s.focus_session("s2");
+        s.pending.clear();
+        s.push_pty_send_raw(vec![0x03]);
+        assert_eq!(
+            s.pending.last(),
+            Some(&PendingPty::SendRaw {
+                id: "s2".into(),
+                bytes: vec![0x03],
+            })
+        );
+    }
+
+    #[test]
+    fn push_pty_send_raw_is_noop_without_active_session() {
+        let mut s = fresh();
+        s.ui.active_session_id = None;
+        s.pending.clear();
+        s.push_pty_send_raw(vec![0x03]);
+        assert!(s.pending.is_empty(), "アクティブ無しなら積まない");
+    }
+
+    #[test]
+    fn push_pty_send_raw_is_noop_for_empty_bytes() {
+        let mut s = fresh();
+        s.focus_session("s2");
+        s.pending.clear();
+        s.push_pty_send_raw(Vec::new());
+        assert!(s.pending.is_empty(), "空バイト列は積まない");
+    }
+
+    #[test]
+    fn submit_input_as_stdin_sends_buffer_with_newline_via_send_raw() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "y".into();
+        }
+        s.pending.clear();
+        let before_block_count = s.active().unwrap().blocks.len();
+        s.submit_input_as_stdin();
+        // SendRaw で "y\n" が積まれる（Send ではない = on_submit 副作用なし）
+        assert_eq!(
+            s.pending.last(),
+            Some(&PendingPty::SendRaw {
+                id: "s3".into(),
+                bytes: b"y\n".to_vec(),
+            })
+        );
+        // 新規ブロックは積まれない
+        assert_eq!(s.active().unwrap().blocks.len(), before_block_count);
+        // input_buffer はクリアされる
+        assert!(s.active().unwrap().input_buffer.is_empty());
+    }
+
+    #[test]
+    fn submit_input_as_stdin_sends_lone_newline_for_empty_buffer() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.pending.clear();
+        s.submit_input_as_stdin();
+        assert_eq!(
+            s.pending.last(),
+            Some(&PendingPty::SendRaw {
+                id: "s3".into(),
+                bytes: b"\n".to_vec(),
+            })
+        );
     }
 
     #[test]

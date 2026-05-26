@@ -26,9 +26,100 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             egui::TopBottomPanel::bottom("input_row")
                 .frame(egui::Frame::none().fill(theme::BG_0))
                 .show_inside(ui, |ui| input_row(ui, state));
+            // running_card は busy 時のみ存在。input_row より後に show すると input_row の
+            // すぐ上に積まれる（egui の bottom panel は show 順に下から積む）。スクロール
+            // 領域から実行中ブロックが流れて見えなくなっても、ここに必ず残る（Warp 風）。
+            if has_running(state) {
+                egui::TopBottomPanel::bottom("running_card")
+                    .frame(egui::Frame::none().fill(theme::BG_1))
+                    .show_separator_line(false)
+                    .show_inside(ui, |ui| running_card(ui, state));
+            }
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(theme::BG_1))
                 .show_inside(ui, |ui| term_area(ui, state));
+        });
+}
+
+/// アクティブセッションの直近ブロックが実行中なら true。
+pub fn has_running(state: &AppState) -> bool {
+    state
+        .active()
+        .and_then(|s| s.blocks.last())
+        .is_some_and(|b| b.running)
+}
+
+/// input_row の上にスティッキー表示する「実行中コマンド」カード。
+/// スクロールでブロックが画面外に流れても、現在 running なコマンドと経過時間 / 中断ヒント
+/// がここに常駐するので「何が動いているか / どう止めるか」を見失わない。
+///
+/// 呼び出し側 (`show()`) が `has_running(state)` で gating する前提のため、ここでの
+/// `running` 再判定は防衛的なフォールバック。`has_running` の判定条件を変える時は
+/// 両者の整合を維持すること。
+fn running_card(ui: &mut egui::Ui, state: &AppState) {
+    let Some(session) = state.active() else {
+        return;
+    };
+    let Some(block) = session.blocks.last().filter(|b| b.running) else {
+        return;
+    };
+
+    let now = ui.input(|i| i.time);
+    let elapsed = crate::clock::now_unix().saturating_sub(block.started_at_unix);
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(40));
+
+    egui::Frame::none()
+        .fill(theme::BG_2)
+        .stroke(egui::Stroke::new(1.0, theme::AMBER.gamma_multiply(0.45)))
+        .rounding(8.0)
+        .inner_margin(egui::Margin {
+            left: 12.0,
+            right: 12.0,
+            top: 8.0,
+            bottom: 8.0,
+        })
+        .outer_margin(egui::Margin {
+            left: 12.0,
+            right: 12.0,
+            top: 0.0,
+            bottom: 6.0,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // 縦バーを pulse させて視線を引く。
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(3.0, 16.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    bar_rect,
+                    1.5,
+                    theme::AMBER.gamma_multiply(widgets::pulse_opacity(now)),
+                );
+                ui.add_space(8.0);
+
+                ui.add(egui::Spinner::new().color(theme::AMBER).size(14.0));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(truncate_for_hint(&block.cmd, 60))
+                        .color(theme::FG_0)
+                        .size(13.0)
+                        .strong(),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("^C で中断")
+                            .color(theme::RUST)
+                            .size(10.5),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format_elapsed(elapsed))
+                            .color(theme::AMBER)
+                            .size(11.0),
+                    );
+                });
+            });
         });
 }
 
@@ -96,16 +187,34 @@ fn term_area(ui: &mut egui::Ui, state: &AppState) {
         return;
     }
 
+    // 下揃え: 前フレームの content 高さを memory に記録し、viewport との差分を
+    // ScrollArea 先頭の spacer として入れる。content が viewport より小さい時は
+    // 最新ブロックが下端に張り付き、超えると spacer が 0 になって通常スクロール。
+    // `Layout::bottom_up` を使わないのは、その中で `ui.horizontal()` 配下の multi-line
+    // テキスト（ls 出力など）の wrap 計算が崩れて行が重なって描画されるため。
+    let cache_id = egui::Id::new(("term_area_content_h", &session.id));
+    let viewport_h = ui.available_height();
+    let prev_content_h: f32 = ui.memory(|m| m.data.get_temp(cache_id).unwrap_or(0.0_f32));
+    let filler = (viewport_h - prev_content_h).max(0.0);
+
     egui::ScrollArea::vertical()
         .id_source("term_area")
+        // ブロック数が viewport を超えた時、コマンド実行中の出力追記で下端追従させる。
+        // 下端にいない時はスティックしない（egui 既定挙動）ので、過去履歴閲覧中は干渉しない。
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            if filler > 0.0 {
+                ui.add_space(filler);
+            }
+            let content_top = ui.cursor().top();
             ui.add_space(14.0);
             for block in &session.blocks {
                 draw_block(ui, block);
                 ui.add_space(8.0);
             }
+            let content_h = ui.cursor().top() - content_top;
+            ui.memory_mut(|m| m.data.insert_temp(cache_id, content_h));
         });
 }
 
@@ -166,7 +275,18 @@ fn draw_block(ui: &mut egui::Ui, block: &Block) {
             egui::pos2(rect.left(), rect.top()),
             egui::pos2(rect.left() + 2.0, rect.bottom()),
         );
-        ui.painter().rect_filled(bar, 1.0, border);
+        // 実行中は status_dot と同じ pulse 波形で縦バーを点滅させ、視線を引く。
+        // cmd_line 側の spinner も同じ ctx を共有するので、ここの 40ms repaint で
+        // 一括して再描画される（spinner 側で追加の request_repaint_after は不要）。
+        let color = if running {
+            let now = ui.input(|i| i.time);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(40));
+            border.gamma_multiply(widgets::pulse_opacity(now))
+        } else {
+            border
+        };
+        ui.painter().rect_filled(bar, 1.0, color);
     }
 }
 
@@ -222,7 +342,36 @@ fn cmd_line(ui: &mut egui::Ui, block: &Block, err: bool) {
                     });
             }
         }
+        if block.running {
+            // 40ms repaint は draw_block の縦バー pulse 側で発行済みなのでここでは追加しない。
+            // spinner は egui の painter ベース（フォント非依存）でフォントに glyph が無い
+            // 環境（macOS 標準 fontset で braille 等が豆腐になる）でも安定して描画される。
+            let elapsed = crate::clock::now_unix().saturating_sub(block.started_at_unix);
+            ui.add_space(8.0);
+            ui.add(egui::Spinner::new().color(theme::AMBER).size(14.0));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format_elapsed(elapsed))
+                    .color(theme::AMBER)
+                    .size(11.0),
+            );
+        }
     });
+}
+
+/// 経過秒数を Warp 風に簡潔フォーマット ("12s" / "1m23s" / "1h02m")。
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m{s:02}s")
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{h}h{m:02}m")
+    }
 }
 
 fn output(ui: &mut egui::Ui, block: &Block) {
@@ -272,7 +421,10 @@ fn input_row(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn input_meta(ui: &mut egui::Ui, state: &mut AppState) {
-    let Some((pwd, hist_len)) = state.active().map(|s| (s.pwd.clone(), s.history.len())) else {
+    let Some((pwd, hist_len, busy_cmd)) = state.active().map(|s| {
+        let busy = s.blocks.last().filter(|b| b.running).map(|b| b.cmd.clone());
+        (s.pwd.clone(), s.history.len(), busy)
+    }) else {
         return;
     };
     let shell_label = match state.ui.shell {
@@ -291,13 +443,45 @@ fn input_meta(ui: &mut egui::Ui, state: &mut AppState) {
         }
         pill(ui, "tana", true, false);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(format!("history: {hist_len} · tab to autocomplete"))
-                    .color(theme::FG_2)
-                    .size(11.0),
-            );
+            // 実行中: 入力が「新コマンド」ではなく「running プロセスの stdin」に流れる
+            // ことを明示し、止め方（^C）も同時に提示する。
+            // 通常: history 件数と tab 補完のヒント。
+            match busy_cmd {
+                Some(cmd) => {
+                    ui.label(
+                        egui::RichText::new("^C で中断")
+                            .color(theme::RUST)
+                            .size(11.0),
+                    );
+                    ui.label(egui::RichText::new("·").color(theme::FG_3).size(11.0));
+                    ui.label(
+                        egui::RichText::new(format!("stdin → {}", truncate_for_hint(&cmd, 32)))
+                            .color(theme::AMBER)
+                            .size(11.0),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(format!("history: {hist_len} · tab to autocomplete"))
+                            .color(theme::FG_2)
+                            .size(11.0),
+                    );
+                }
+            }
         });
     });
+}
+
+/// hint バナー用に文字列を最大 `max_chars` 文字に切り詰め、超過分は `…` に置換する。
+/// マルチバイト文字を含む可能性があるため `chars()` 単位で扱う。
+fn truncate_for_hint(s: &str, max_chars: usize) -> String {
+    debug_assert!(max_chars >= 2, "末尾 `…` を入れるため最低 2 文字必要");
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max_chars - 1).collect();
+    format!("{kept}…")
 }
 
 /// input meta の pill。`clickable` の場合は hover で手のカーソルにする。
@@ -335,6 +519,10 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
     // input_buffer を一旦取り出し、TextEdit に渡している間は state を非借用にする。
     // describe→state.* を呼び出せる構造を保つための定石パターン。
     let has_active = state.active().is_some();
+    // Busy 時は「入力が新コマンドでなく running プロセスの stdin へ届く」ことを hint で示す。
+    let busy_cmd: Option<String> = state
+        .active()
+        .and_then(|s| s.blocks.last().filter(|b| b.running).map(|b| b.cmd.clone()));
     let mut buf = state
         .active_mut()
         .map(|s| std::mem::take(&mut s.input_buffer))
@@ -359,17 +547,19 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                         .size(13.5),
                 );
                 if has_active {
+                    let hint = match &busy_cmd {
+                        Some(cmd) => {
+                            format!("type to send stdin to {}…", truncate_for_hint(cmd, 24))
+                        }
+                        None => "type a command…".to_string(),
+                    };
                     let edit = egui::TextEdit::singleline(&mut buf)
                         .id(input_id())
                         .frame(false)
                         .text_color(theme::FG_0)
                         .font(egui::FontId::monospace(13.5))
                         .desired_width(ui.available_width() - 100.0)
-                        .hint_text(
-                            egui::RichText::new("type a command…")
-                                .color(theme::FG_3)
-                                .size(13.0),
-                        );
+                        .hint_text(egui::RichText::new(hint).color(theme::FG_3).size(13.0));
                     let r = ui.add(edit);
                     // singleline は Enter でフォーカスを失うため、その瞬間は has_focus() が
                     // false になる。Enter は lost_focus() + キー押下で検出する（egui の定石）。
@@ -400,7 +590,14 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     widgets::kbd_return(ui);
-                    ui.label(egui::RichText::new("press").color(theme::FG_3).size(11.0));
+                    // busy 時は "send stdin"、idle 時は "press" にして
+                    // input_meta の「stdin → {cmd}」とラベルの意図を揃える。
+                    let leading = if busy_cmd.is_some() {
+                        "send stdin"
+                    } else {
+                        "press"
+                    };
+                    ui.label(egui::RichText::new(leading).color(theme::FG_3).size(11.0));
                 });
             });
         })
@@ -424,7 +621,13 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if submit {
-        state.submit_input(clock::now_hhmm());
+        // busy 時: 入力は新コマンドではなく、実行中プロセスの stdin として転送する。
+        // hint「stdin → {cmd}」と一致させる。`busy_cmd` は関数頭で取得済み（同フレーム）。
+        if busy_cmd.is_some() {
+            state.submit_input_as_stdin();
+        } else {
+            state.submit_input(clock::now_hhmm());
+        }
         // 連続入力できるよう入力欄に再フォーカスする（Enter で外れた分を取り戻す）。
         ui.ctx().memory_mut(|m| m.request_focus(input_id()));
     }
@@ -436,5 +639,47 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
     }
     if complete {
         state.tab_complete();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_elapsed, truncate_for_hint};
+
+    #[test]
+    fn truncate_for_hint_keeps_short_strings_as_is() {
+        assert_eq!(truncate_for_hint("ls", 10), "ls");
+        assert_eq!(truncate_for_hint("0123456789", 10), "0123456789");
+    }
+
+    #[test]
+    fn truncate_for_hint_replaces_overflow_with_ellipsis() {
+        assert_eq!(truncate_for_hint("01234567890", 10), "012345678…");
+    }
+
+    #[test]
+    fn truncate_for_hint_counts_multibyte_chars_correctly() {
+        // 6 文字 (3 漢字 + 3 ascii) は max=6 で無加工
+        assert_eq!(truncate_for_hint("日本語abc", 6), "日本語abc");
+        // 8 文字を max=5 で切り詰め
+        assert_eq!(truncate_for_hint("日本語テスト用", 5), "日本語テ…");
+    }
+
+    #[test]
+    fn format_elapsed_seconds_only() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(59), "59s");
+    }
+
+    #[test]
+    fn format_elapsed_minutes_with_zero_padded_seconds() {
+        assert_eq!(format_elapsed(60), "1m00s");
+        assert_eq!(format_elapsed(3599), "59m59s");
+    }
+
+    #[test]
+    fn format_elapsed_hours_with_zero_padded_minutes() {
+        assert_eq!(format_elapsed(3600), "1h00m");
+        assert_eq!(format_elapsed(3661), "1h01m");
     }
 }

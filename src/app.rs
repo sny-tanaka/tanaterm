@@ -29,6 +29,7 @@ pub struct TanaTermApp {
 impl TanaTermApp {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
         theme::apply(&cc.egui_ctx);
+        register_cjk_fallback(&cc.egui_ctx);
         ui::widgets::register_icons(&cc.egui_ctx);
 
         // 保存済み状態があれば復元、なければ空 1 セッションで起動（shell は設定ファイル既定）。
@@ -58,7 +59,11 @@ impl eframe::App for TanaTermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = ctx.input(|i| i.time);
         self.state.tick_toast(now);
+        // 順序: まずグローバルショートカット（⌘W 等）を consume し、残ったキーから
+        // Ctrl 修飾の制御キーを PTY 転送用に consume する。逆順にすると将来
+        // handle_shortcuts に追加した Ctrl 系ショートカットが PTY 側に流れてしまう。
         self.handle_shortcuts(ctx);
+        self.forward_pty_control_keys(ctx);
 
         // 1) PTY 出力を取り込んで AppState に反映（描画前に最新化）。
         self.pump_pty();
@@ -110,12 +115,15 @@ impl TanaTermApp {
         if self.state.pending.is_empty() {
             return;
         }
-        let (rows, cols) = term_grid_size(ctx, main_rect);
         // 起動シェルは入力行のトグル（UiState.shell）を反映する（plan 2.1）。
         let shell = self.state.ui.shell;
         for action in std::mem::take(&mut self.state.pending) {
             match action {
                 PendingPty::Spawn { id, cwd } => {
+                    // rows/cols は spawn 直前の has_running 状態を反映するように
+                    // ここで都度計算する。pending に Spawn + Send が並んだ時、Send 側で
+                    // 直近ブロックが running 化される前後で行高が変わる可能性に備える。
+                    let (rows, cols) = term_grid_size(ctx, main_rect, &self.state);
                     self.pty.spawn(
                         &id,
                         SpawnSpec {
@@ -132,6 +140,9 @@ impl TanaTermApp {
                     self.pty.on_submit(&id);
                     self.pty.send(&id, &bytes);
                 }
+                PendingPty::SendRaw { id, bytes } => {
+                    self.pty.send(&id, &bytes);
+                }
                 PendingPty::Close { id } => self.pty.close(&id),
             }
         }
@@ -139,7 +150,7 @@ impl TanaTermApp {
 
     /// ターミナル領域のサイズから rows/cols を算出し、変化時のみ全セッションへ反映する。
     fn sync_pty_size(&mut self, ctx: &egui::Context, main_rect: egui::Rect) {
-        let size = term_grid_size(ctx, main_rect);
+        let size = term_grid_size(ctx, main_rect, &self.state);
         if size == self.last_size {
             return;
         }
@@ -200,6 +211,31 @@ impl TanaTermApp {
             }
         }
     }
+
+    /// Ctrl 修飾キー（C/D/Z/\）を ASCII 制御文字としてアクティブセッションの PTY へ転送する。
+    ///
+    /// 入力行 `TextEdit` は Enter/Tab/↑↓ しか拾わないため、実行中コマンドへ SIGINT 等を
+    /// 送る手段が他にない。`consume_key` で先取りすることで、Ctrl+C の "c" が TextEdit に
+    /// 流れ込んで文字として挿入されるのも防ぐ。
+    fn forward_pty_control_keys(&mut self, ctx: &egui::Context) {
+        const BINDINGS: &[(egui::Key, u8)] = &[
+            (egui::Key::C, 0x03),         // ETX  / SIGINT
+            (egui::Key::D, 0x04),         // EOT  / EOF
+            (egui::Key::Z, 0x1a),         // SUB  / SIGTSTP
+            (egui::Key::Backslash, 0x1c), // FS   / SIGQUIT
+        ];
+        let mut to_send: Vec<u8> = Vec::new();
+        ctx.input_mut(|i| {
+            for &(key, byte) in BINDINGS {
+                if i.consume_key(egui::Modifiers::CTRL, key) {
+                    to_send.push(byte);
+                }
+            }
+        });
+        for byte in to_send {
+            self.state.push_pty_send_raw(vec![byte]);
+        }
+    }
 }
 
 /// Toast 描画用に CentralPanel 領域を概算する。左右 rail と top/bottom bar を除いた残り。
@@ -226,13 +262,22 @@ fn central_main_rect(ctx: &egui::Context, state: &AppState) -> egui::Rect {
 
 /// ターミナル出力領域のピクセル寸法から PTY の (rows, cols) を見積もる。
 ///
-/// term_head（上）と input 行（下）の高さ分を差し引いた概算。等幅フォントの 1 文字幅・
-/// 行高を egui のフォントメトリクスから取り、最低サイズでクランプする。
-fn term_grid_size(ctx: &egui::Context, main_rect: egui::Rect) -> (u16, u16) {
+/// term_head（上）と input 行（下）の高さ分を差し引いた概算。busy 時は running_card が
+/// input 行の上に挟まる（≈ 40px）ぶんも差し引く。等幅フォントの 1 文字幅・行高を egui の
+/// フォントメトリクスから取り、最低サイズでクランプする。
+fn term_grid_size(ctx: &egui::Context, main_rect: egui::Rect, state: &AppState) -> (u16, u16) {
     const FONT: f32 = 12.5;
     // term_head ≈ 44px、input 行（meta + 入力枠 + margin）≈ 96px。
-    const RESERVED_H: f32 = 140.0;
+    const RESERVED_BASE_H: f32 = 140.0;
+    // running_card（frame + outer margin）≈ 40px。
+    const RUNNING_CARD_H: f32 = 40.0;
     const PAD_X: f32 = 32.0;
+
+    let reserved_h = if ui::central::has_running(state) {
+        RESERVED_BASE_H + RUNNING_CARD_H
+    } else {
+        RESERVED_BASE_H
+    };
 
     let (char_w, line_h) = ctx.fonts(|f| {
         let font = egui::FontId::monospace(FONT);
@@ -242,8 +287,41 @@ fn term_grid_size(ctx: &egui::Context, main_rect: egui::Rect) -> (u16, u16) {
     });
 
     let cols = ((main_rect.width() - PAD_X) / char_w).floor().max(20.0) as u16;
-    let rows = ((main_rect.height() - RESERVED_H) / line_h)
+    let rows = ((main_rect.height() - reserved_h) / line_h)
         .floor()
         .max(4.0) as u16;
     (rows, cols)
+}
+
+/// macOS の CJK フォントを fallback として fontset に追加する。
+///
+/// egui のデフォルトは Latin のみなので、何もしないと日本語/中国語/韓国語が
+/// 全部豆腐になる。`/System/Library/Fonts/` から候補を順に探し、最初に読めた
+/// .ttc/.ttf を Proportional / Monospace 両 family の末尾に積んでフォールバック
+/// 順を作る。見つからない場合は何もせず、CJK が出ない既存挙動のままにする。
+fn register_cjk_fallback(ctx: &egui::Context) {
+    // 日本語の仮名と CJK 統合漢字をカバーしているフォントを優先順位順に試す。
+    // Hiragino Sans GB は中国語向けだが、ヒラギノ系の仮名グリフを同梱しているため
+    // 日本語入力でもひらがな/カタカナ/漢字すべて描画できる。
+    const CANDIDATES: &[&str] = &[
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+    ];
+
+    for path in CANDIDATES {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        const NAME: &str = "system-cjk";
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert(NAME.into(), egui::FontData::from_owned(bytes));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(NAME.into());
+        }
+        ctx.set_fonts(fonts);
+        return;
+    }
 }
