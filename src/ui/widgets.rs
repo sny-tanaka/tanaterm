@@ -7,7 +7,7 @@
 //! - `sidebar_toggle_button`: TopBar のレール toggle 用、角丸枠＋縦線を painter で直接描く 28x28 ボタン。
 //! - `paint_brand_mark`: 棚（shelf）ブランドマーク。amber 角丸＋濃い横線 2 本を painter で描く。
 //! - `paint_return_arrow`: ↵ Enter アイコン。縦線＋横線＋矢じりを painter で描く。
-//! - `kbd_return`: `kbd("↵")` の painter 版。Unicode グリフ非対応フォント対策。
+//! - `kbd_return_button`: 入力欄右の送信ボタン。`kbd("↵")` の painter 版を click 化したもの。
 //! - `icon_image`: keep.png / edit.png を tint して描く SVG 由来アイコン。
 //! - `row`: rail 行の共通枠（hover / active で背景を切替・全面クリック）。
 //!
@@ -109,20 +109,40 @@ pub fn kbd(ui: &mut egui::Ui, label: &str) -> egui::Response {
         .response
 }
 
-/// `↵` の代わりに return-arrow を painter で描く kbd 風バッジ。
-/// egui デフォルトフォントが U+21B5 を持たないため、`kbd(ui, "↵")` だと豆腐になる。
-pub fn kbd_return(ui: &mut egui::Ui) -> egui::Response {
-    egui::Frame::none()
+/// `↵` の代わりに return-arrow を painter で描く kbd 風の送信ボタン。
+/// egui デフォルトフォントが U+21B5 を持たないため、テキストの "↵" だと豆腐になる。
+///
+/// 入力欄右に置く submit ボタンとして使う。見た目はキーキャップ風で、hover 時に
+/// 矢印を amber へ切り替えて「押せること」を示す。クリック判定は Frame の外側
+/// rect 全体に被せる。
+pub fn kbd_return_button(ui: &mut egui::Ui) -> egui::Response {
+    // 先に rect を予約し、その上から Frame と interact を被せる。
+    // Frame::show().response の rect は Frame の外側に一致するので、その rect を
+    // ui.interact に渡せば矢印（painter 描画）の上をクリックしても確実にヒットする。
+    let frame_resp = egui::Frame::none()
         .fill(theme::BG_2)
         .stroke(egui::Stroke::new(1.0, theme::LINE))
         .rounding(4.0)
         .inner_margin(egui::Margin::symmetric(4.0, 1.0))
         .show(ui, |ui| {
-            // kbd の他文字（"⌘K" 等）に高さを揃える: size 10 のテキストとほぼ同じ縦寸。
             let (rect, _) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
-            paint_return_arrow(ui.painter(), rect, theme::FG_1);
+            // hover 時は矢印を amber にする（押せることの視認性）。
+            // 実際の hovered 判定は外側 rect で行うため、ここでは描画だけ済ませて
+            // 1 フレーム遅延で色を切り替える（PointingHand と同タイミングになる）。
+            let hovered = ui.rect_contains_pointer(rect);
+            let color = if hovered { theme::AMBER } else { theme::FG_1 };
+            paint_return_arrow(ui.painter(), rect, color);
         })
-        .response
+        .response;
+    let resp = ui.interact(
+        frame_resp.rect,
+        ui.id().with("kbd_return_button"),
+        egui::Sense::click(),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
 }
 
 /// inline ラベル（"open ↵" 等）の代わりに使う小さな return-arrow。

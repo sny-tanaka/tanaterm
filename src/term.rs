@@ -471,17 +471,38 @@ impl SessionTerm {
                     }
                 }
                 BlockEvent::CommandEnd { exit } => {
-                    if self.in_command {
-                        actions.push(TermAction::EndBlock { exit });
-                        self.in_command = false;
+                    // Osc133 モード（= C を観測済み）でのみ EndBlock を発火する。
+                    // Auto モードで D だけ先に来るのは「シェル起動直後の初回 precmd」のケース
+                    // （hook 登録済みで PROMPT 表示前に走る precmd が D;0, A, OSC 7 を吐く）。
+                    // ここで EndBlock すると、まだユーザーコマンド未実行の running ブロックを
+                    // 閉じてしまい、続く OSC 133;C の Append も「running ブロックなし」で
+                    // 捨てられ、初回コマンドが永久に実行されないように見えるバグになる。
+                    // よって Auto モードでは EndBlock せず、Osc133 確定の合図として扱い、
+                    // Auto で先取りしていた echo は ClearOutput で捨てて C を待つ。
+                    if matches!(self.mode, Mode::Osc133) {
+                        if self.in_command {
+                            actions.push(TermAction::EndBlock { exit });
+                            self.in_command = false;
+                        }
+                    } else {
+                        self.mode = Mode::Osc133;
+                        if self.in_command {
+                            actions.push(TermAction::ClearOutput);
+                            self.in_command = false;
+                        }
                     }
                 }
                 BlockEvent::PromptStart => {
-                    // Auto モードでプロンプトが来たら直前コマンドの終わりとみなす
-                    // （実際には OSC 133 整合シェルでしか A は来ないため通常は Osc133 側）。
-                    if matches!(self.mode, Mode::Auto) && self.in_command {
-                        actions.push(TermAction::EndBlock { exit: None });
-                        self.in_command = false;
+                    // A も「シェルが OSC 133 を出す合図」。Auto モードで来たら
+                    // Osc133 確定の合図とし、in_command なら ClearOutput で先取りを捨てる
+                    // （ユーザーコマンド未実行のままブロックを閉じない）。
+                    // Osc133 モードでの A 単独受信は無視（直前の D で EndBlock 済み）。
+                    if matches!(self.mode, Mode::Auto) {
+                        self.mode = Mode::Osc133;
+                        if self.in_command {
+                            actions.push(TermAction::ClearOutput);
+                            self.in_command = false;
+                        }
                     }
                 }
                 BlockEvent::Cwd(path) => actions.push(TermAction::SetCwd(path)),
@@ -659,5 +680,66 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, TermAction::EndBlock { exit: None })));
+    }
+
+    /// 「初回コマンドが実行されない」回帰防止。
+    ///
+    /// シェル起動直後の初回 `precmd` で OSC 133;D;0, A, OSC 7 が出る。これは
+    /// 「次のプロンプトの前奏」であり、ユーザーコマンドの終端ではない。
+    /// `on_submit` で `in_command=true` (Auto) になった直後にこの D を受け取っても、
+    /// EndBlock を発火させず、ClearOutput で先取りを捨てて C を待つこと。
+    ///
+    /// 元の実装では Auto モードでも D で EndBlock していたため、初回コマンドの
+    /// 実 PTY 結果が「running ブロックなし」状態で全部捨てられていた。
+    #[test]
+    fn session_term_initial_precmd_d_does_not_close_user_block() {
+        let mut t = SessionTerm::new();
+        t.on_submit(); // Auto モード, in_command=true
+
+        // シェル初回 precmd: D;0 → A → OSC 7、続いて echo "ls", C, "out\n", D;0
+        let raw = b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]7;file://h/tmp\x07ls\r\n\x1b]133;C\x07out\n\x1b]133;D;0\x07";
+        let actions = t.feed(raw);
+
+        // 初回 D で EndBlock(exit=0) してはいけない（その後 EndBlock 1 回は OK）。
+        let end_blocks: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, TermAction::EndBlock { .. }))
+            .collect();
+        assert_eq!(
+            end_blocks.len(),
+            1,
+            "EndBlock は最後の D だけで 1 回のみ発火する: {actions:?}",
+        );
+        // 初回 D の代わりに ClearOutput で先取りを捨てている。
+        assert!(actions.contains(&TermAction::ClearOutput));
+        // 実 ls 出力 "out" は Append されている。
+        let appended: String = actions
+            .iter()
+            .filter_map(|a| match a {
+                TermAction::Append(spans) => Some(spans.iter().map(|s| s.text.clone()).collect()),
+                _ => None,
+            })
+            .collect::<Vec<String>>()
+            .join("");
+        assert!(
+            appended.contains("out"),
+            "ls 出力が block に届く: appended={appended:?}",
+        );
+    }
+
+    /// Auto モードで A（PromptStart）だけ先に来た場合も同様に EndBlock せず、
+    /// ClearOutput + Osc133 確定の合図として扱うこと。
+    #[test]
+    fn session_term_initial_prompt_a_does_not_close_user_block() {
+        let mut t = SessionTerm::new();
+        t.on_submit();
+        let actions = t.feed(b"\x1b]133;A\x07");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, TermAction::EndBlock { .. })),
+            "EndBlock してはいけない: {actions:?}",
+        );
+        assert!(actions.contains(&TermAction::ClearOutput));
     }
 }
