@@ -8,6 +8,8 @@
 //! - `paint_brand_mark`: 棚（shelf）ブランドマーク。amber 角丸＋濃い横線 2 本を painter で描く。
 //! - `paint_return_arrow`: ↵ Enter アイコン。縦線＋横線＋矢じりを painter で描く。
 //! - `kbd_return_button`: 入力欄右の送信ボタン。`kbd("↵")` の painter 版を click 化したもの。
+//! - `section_divider`: セクション見出し直下の「棚板ライン」。1px LINE_2 ＋ 上 1px に amber 5% 反射。
+//! - `row_hairline`: rail アイテム間の薄い区切り線（1px LINE、左右 6px インセット）。
 //! - `icon_image`: keep.png / edit.png を tint して描く SVG 由来アイコン。
 //! - `row`: rail 行の共通枠（hover / active で背景を切替・全面クリック）。
 //!
@@ -242,6 +244,7 @@ pub fn section_header(ui: &mut egui::Ui, title: &str, count: usize) {
         );
     });
     ui.add_space(2.0);
+    section_divider(ui);
 }
 
 /// カウント数値なしのセクション見出し（"COMMANDS" のような親見出し用）。
@@ -256,6 +259,39 @@ pub fn section_header_plain(ui: &mut egui::Ui, title: &str) {
         );
     });
     ui.add_space(2.0);
+    section_divider(ui);
+}
+
+/// セクション見出し直下の「棚板ライン」。
+///
+/// 1px LINE_2 罫線 + その上 1px に amber 5% 反射を重ねる（"光が棚板の縁に
+/// 当たる" 表現）。`docs/redesign.md` §2 の棚メタファー強化用。
+pub fn section_divider(ui: &mut egui::Ui) {
+    let avail = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(avail, 2.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let top = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 1.0));
+    let bottom = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.bottom() - 1.0),
+        egui::vec2(rect.width(), 1.0),
+    );
+    painter.rect_filled(top, 0.0, theme::AMBER_GLOW);
+    painter.rect_filled(bottom, 0.0, theme::LINE_2);
+}
+
+/// rail アイテム間の薄い区切り線（1px LINE、左右 6px インセット）。
+///
+/// 縦リスト中、各 row の後に呼び出すとアイテム間 hairline になる。最終行の
+/// 後にも 1 本入るのは仕様（外枠の罫線と合流して悪目立ちはしない）。
+pub fn row_hairline(ui: &mut egui::Ui) {
+    let avail = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(avail, 1.0), egui::Sense::hover());
+    let inset = 6.0;
+    let line = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + inset, rect.top()),
+        egui::vec2((rect.width() - inset * 2.0).max(0.0), 1.0),
+    );
+    ui.painter().rect_filled(line, 0.0, theme::LINE);
 }
 
 /// 28x28 のアイコンボタン（TopBar / section header 末尾用）。
@@ -366,12 +402,27 @@ pub fn row(
     ui.painter().rect_filled(rect, 6.0, bg);
 
     // active セッションの左 amber アクセント (`.sess.active::before`)。
+    // docs/redesign.md §3: 幅 2→3px、右側だけ角丸、背後に amber 5% glow。
     if state == RowState::Active {
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(rect.left() - 6.0, rect.top() + 6.0),
-            egui::pos2(rect.left() - 4.0, rect.bottom() - 6.0),
-        );
-        ui.painter().rect_filled(bar, 1.0, theme::AMBER);
+        let bar_left = rect.left() - 6.0;
+        let bar_right = bar_left + 3.0;
+        let top = rect.top() + 6.0;
+        let bottom = rect.bottom() - 6.0;
+        let bar =
+            egui::Rect::from_min_max(egui::pos2(bar_left, top), egui::pos2(bar_right, bottom));
+        // glow（背後に同心の amber 5% 矩形を 1 段だけ広げて敷く）。
+        // CSS の box-shadow: 0 0 8px は egui で完全再現できないため、
+        // 矩形 1 段の近似（縦 +4 / 横 +6）で「滲み」を表現する。
+        let glow = bar.expand2(egui::vec2(6.0, 4.0));
+        ui.painter().rect_filled(glow, 4.0, theme::AMBER_GLOW);
+        // 右側だけ角丸（`border-radius: 0 2px 2px 0`）。
+        let rounding = egui::Rounding {
+            nw: 0.0,
+            ne: 2.0,
+            sw: 0.0,
+            se: 2.0,
+        };
+        ui.painter().rect_filled(bar, rounding, theme::AMBER);
     }
 
     let inner = rect.shrink2(egui::vec2(8.0, 0.0));

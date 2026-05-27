@@ -35,7 +35,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .default_height(300.0)
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
-                    ui.add_space(10.0);
+                    ui.add_space(14.0);
                     widgets::section_header(ui, "SESSIONS", state.sessions.len());
                     if text_button(ui, "+ new session", Some("⌘T")) {
                         state.new_session("new session", "~/");
@@ -50,7 +50,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
-                    ui.add_space(10.0);
+                    ui.add_space(14.0);
                     widgets::section_header(ui, "SHELF", state.shelf.len());
                     if text_button(ui, "★ add current folder", None) {
                         let now = ui.input(|i| i.time);
@@ -65,6 +65,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
 fn sessions_list(ui: &mut egui::Ui, state: &mut AppState) {
     let session_ids: Vec<String> = state.sessions.iter().map(|s| s.id.clone()).collect();
     let active_id = state.ui.active_session_id.clone();
+    let last_idx = session_ids.len().saturating_sub(1);
 
     egui::ScrollArea::vertical()
         .id_source("rail_l_sessions_scroll")
@@ -72,12 +73,16 @@ fn sessions_list(ui: &mut egui::Ui, state: &mut AppState) {
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
             let row_w = (ui.available_width() - 12.0).max(80.0);
-            for id in session_ids {
+            for (i, id) in session_ids.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    session_row(ui, state, &id, active_id.as_deref() == Some(&id), row_w);
+                    session_row(ui, state, id, active_id.as_deref() == Some(id), row_w);
                 });
                 ui.add_space(2.0);
+                // アイテム間 hairline（最終行の後には引かない）。
+                if i != last_idx {
+                    widgets::row_hairline(ui);
+                }
             }
         });
 }
@@ -193,6 +198,7 @@ fn session_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, active: bool, 
 
 fn shelf_list(ui: &mut egui::Ui, state: &mut AppState) {
     let ids: Vec<String> = state.shelf.iter().map(|s| s.id.clone()).collect();
+    let last_idx = ids.len().saturating_sub(1);
 
     egui::ScrollArea::vertical()
         .id_source("rail_l_shelf_scroll")
@@ -200,12 +206,15 @@ fn shelf_list(ui: &mut egui::Ui, state: &mut AppState) {
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
             let row_w = (ui.available_width() - 12.0).max(80.0);
-            for id in ids {
+            for (i, id) in ids.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    shelf_row(ui, state, &id, row_w);
+                    shelf_row(ui, state, id, row_w);
                 });
                 ui.add_space(2.0);
+                if i != last_idx {
+                    widgets::row_hairline(ui);
+                }
             }
         });
 }
