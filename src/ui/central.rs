@@ -209,13 +209,37 @@ fn term_area(ui: &mut egui::Ui, state: &AppState) {
             }
             let content_top = ui.cursor().top();
             ui.add_space(14.0);
-            for block in &session.blocks {
+            // docs/redesign.md §4: ブロック間に余白 + 1px hairline を入れる。
+            // 最終ブロック後は hairline 無しで余白のみ（外枠の divider と二重に
+            // ならないようにする）。
+            let last = session.blocks.len().saturating_sub(1);
+            for (i, block) in session.blocks.iter().enumerate() {
                 draw_block(ui, block);
-                ui.add_space(8.0);
+                if i != last {
+                    ui.add_space(4.0);
+                    block_divider(ui);
+                    ui.add_space(4.0);
+                } else {
+                    ui.add_space(8.0);
+                }
             }
             let content_h = ui.cursor().top() - content_top;
             ui.memory_mut(|m| m.data.insert_temp(cache_id, content_h));
         });
+}
+
+/// ターミナルブロック間に引く 1px hairline（左右 12px インセット）。
+///
+/// docs/redesign.md §4 のブロック区切り。色は `LINE` で、棚板ラインより薄い。
+fn block_divider(ui: &mut egui::Ui) {
+    let avail = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(avail, 1.0), egui::Sense::hover());
+    let inset = 12.0;
+    let line = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + inset, rect.top()),
+        egui::vec2((rect.width() - inset * 2.0).max(0.0), 1.0),
+    );
+    ui.painter().rect_filled(line, 0.0, theme::LINE);
 }
 
 fn empty_placeholder(ui: &mut egui::Ui, session: &Session) {
@@ -614,13 +638,17 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
         s.input_buffer = buf;
     }
 
-    // focus ring (1px amber + 3px amber-soft 風)。
+    // focus ring。docs/redesign.md §5: 枠線の色変化に加え 3px の半透明 amber リング
+    // (rgba(232,166,82,.14)) を外側に重ねる。1px amber の輪郭は据え置きで、輪郭の
+    // すぐ外側に薄い amber ハロを敷くことで「フォーカスが当たっている」ことを強調する。
     if ui.ctx().memory(|m| m.has_focus(input_id())) {
+        // 外側 3px の amber 14% リング（CSS の box-shadow: 0 0 0 3px に相当）。
         ui.painter().rect_stroke(
-            frame_resp.rect.expand(2.0),
+            frame_resp.rect.expand(1.5),
             8.0,
-            egui::Stroke::new(2.0, theme::AMBER_SOFT),
+            egui::Stroke::new(3.0, theme::AMBER_RING),
         );
+        // 内側 1px の amber 輪郭。
         ui.painter()
             .rect_stroke(frame_resp.rect, 8.0, egui::Stroke::new(1.0, theme::AMBER));
     }

@@ -10,27 +10,30 @@
 
 use eframe::egui::{self, Color32};
 
-/// 背景: rails / topbar / statusbar など chrome 部 (`--bg-0`).
-pub const BG_0: Color32 = Color32::from_rgb(0x14, 0x11, 0x0d);
-/// 背景: ターミナルキャンバス / input bg (`--bg-1`).
-pub const BG_1: Color32 = Color32::from_rgb(0x1a, 0x16, 0x12);
-/// 背景: hover (`--bg-2`).
-pub const BG_2: Color32 = Color32::from_rgb(0x22, 0x1d, 0x17);
-/// 背景: active カード / tab active (`--bg-3`).
-pub const BG_3: Color32 = Color32::from_rgb(0x2a, 0x23, 0x1b);
+// docs/redesign.md のコントラスト強化に合わせて値を下げた。
+// 「より深い chrome / より暖かい前景」の方向。
 
-/// デフォルト境界線 (`--line`).
-pub const LINE: Color32 = Color32::from_rgb(0x2e, 0x26, 0x20);
-/// 強めの境界線 / input border (`--line-2`).
-pub const LINE_2: Color32 = Color32::from_rgb(0x3a, 0x30, 0x25);
+/// 背景: rails / topbar / statusbar など chrome 部 (`--bg-0`).
+pub const BG_0: Color32 = Color32::from_rgb(0x0a, 0x08, 0x05);
+/// 背景: ターミナルキャンバス / input bg (`--bg-1`).
+pub const BG_1: Color32 = Color32::from_rgb(0x10, 0x0c, 0x08);
+/// 背景: hover (`--bg-2`).
+pub const BG_2: Color32 = Color32::from_rgb(0x19, 0x13, 0x10);
+/// 背景: active カード / tab active (`--bg-3`).
+pub const BG_3: Color32 = Color32::from_rgb(0x24, 0x1c, 0x13);
+
+/// デフォルト境界線 (`--line`). セクション内のアイテム間 hairline にも使う。
+pub const LINE: Color32 = Color32::from_rgb(0x1c, 0x16, 0x10);
+/// 強めの境界線 / input border (`--line-2`). 棚板ラインにも使う。
+pub const LINE_2: Color32 = Color32::from_rgb(0x2c, 0x22, 0x18);
 
 /// 主要テキスト (`--fg-0`).
-pub const FG_0: Color32 = Color32::from_rgb(0xf5, 0xed, 0xe0);
+pub const FG_0: Color32 = Color32::from_rgb(0xf0, 0xe6, 0xd2);
 /// 副次テキスト (`--fg-1`).
-pub const FG_1: Color32 = Color32::from_rgb(0xb9, 0xa9, 0x8c);
+pub const FG_1: Color32 = Color32::from_rgb(0xbc, 0xa8, 0x87);
 /// muted (`--fg-2`).
-pub const FG_2: Color32 = Color32::from_rgb(0x7a, 0x6a, 0x51);
-/// 最暗 (`--fg-3`).
+pub const FG_2: Color32 = Color32::from_rgb(0x89, 0x7a, 0x5b);
+/// 最暗 (`--fg-3`). リデザインでは据え置き（要件表に記載なし）。
 pub const FG_3: Color32 = Color32::from_rgb(0x57, 0x4a, 0x37);
 
 /// 主アクセント (`--amber`).
@@ -40,6 +43,16 @@ pub const AMBER: Color32 = Color32::from_rgb(0xe8, 0xa6, 0x52);
 /// CSS: `rgba(232, 166, 82, .16)`. premultiplied で
 /// (232*.16, 166*.16, 82*.16, .16*255) = (37, 27, 13, 41).
 pub const AMBER_SOFT: Color32 = Color32::from_rgba_premultiplied(37, 27, 13, 41);
+/// amber 5% glow（active session bar の背後・棚板ラインの上反射に使う）。
+///
+/// CSS: `rgba(232, 166, 82, .05)`. premultiplied で
+/// (232*.05, 166*.05, 82*.05, .05*255) = (12, 8, 4, 13).
+pub const AMBER_GLOW: Color32 = Color32::from_rgba_premultiplied(12, 8, 4, 13);
+/// amber 14%（入力欄 focus ring）。
+///
+/// CSS: `rgba(232, 166, 82, .14)`. premultiplied で
+/// (232*.14, 166*.14, 82*.14, .14*255) = (32, 23, 11, 36).
+pub const AMBER_RING: Color32 = Color32::from_rgba_premultiplied(32, 23, 11, 36);
 /// git branch / success (`--sage`).
 pub const SAGE: Color32 = Color32::from_rgb(0x87, 0xa8, 0x78);
 /// sage 14% (`--sage-soft`). live dot のグロー用。
@@ -58,15 +71,17 @@ pub const PLUM: Color32 = Color32::from_rgb(0xb4, 0x8e, 0xad);
 pub const AZURE: Color32 = Color32::from_rgb(0x7a, 0xb0, 0xc8);
 
 /// 固定レイアウト寸法。CSS の `--rail-l` 等と一対一対応。
+///
+/// docs/redesign.md に従い、TOPBAR / STATUSBAR / RAIL_L を一段増やした。
 pub mod dims {
     /// 左 rail の幅。
-    pub const RAIL_L: f32 = 248.0;
+    pub const RAIL_L: f32 = 252.0;
     /// 右 rail の幅。
     pub const RAIL_R: f32 = 280.0;
     /// TopBar の高さ。
-    pub const TOPBAR: f32 = 40.0;
+    pub const TOPBAR: f32 = 42.0;
     /// StatusBar の高さ。
-    pub const STATUSBAR: f32 = 24.0;
+    pub const STATUSBAR: f32 = 26.0;
 }
 
 /// density = regular の spacing (`[data-density="regular"]`).

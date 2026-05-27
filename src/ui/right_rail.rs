@@ -35,7 +35,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
         )
         .show(ctx, |ui| {
             // COMMANDS は PINNED / RECENT を束ねる親見出し（数値カウントは出さない）。
-            ui.add_space(10.0);
+            ui.add_space(14.0);
             widgets::section_header_plain(ui, "COMMANDS");
             command_add(ui, state);
 
@@ -178,6 +178,7 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
         return;
     }
 
+    let last_idx = ids.len().saturating_sub(1);
     egui::ScrollArea::vertical()
         .id_source(match section {
             Section::Pinned => "rail_r_pinned_scroll",
@@ -187,12 +188,15 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
             let row_w = (ui.available_width() - 12.0).max(80.0);
-            for id in ids {
+            for (i, id) in ids.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    command_row(ui, state, &id, row_w, now_secs);
+                    command_row(ui, state, id, row_w, now_secs);
                 });
                 ui.add_space(2.0);
+                if i != last_idx {
+                    widgets::row_hairline(ui);
+                }
             }
         });
 }
