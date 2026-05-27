@@ -589,7 +589,12 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::kbd_return(ui);
+                    // ↵ ボタンは見た目「リターンキー」だが実体は送信ボタン。クリックでも
+                    // Enter 押下と同じ submit が走るようにする（lost_focus + Enter のキー
+                    // ハンドリングと分岐は同じ）。busy 時は「stdin 送信」を意味する。
+                    if widgets::kbd_return_button(ui).clicked() {
+                        submit = true;
+                    }
                     // busy 時は "send stdin"、idle 時は "press" にして
                     // input_meta の「stdin → {cmd}」とラベルの意図を揃える。
                     let leading = if busy_cmd.is_some() {
