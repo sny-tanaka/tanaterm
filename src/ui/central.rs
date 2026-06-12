@@ -715,6 +715,16 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                                 .size(input_fs - 0.5),
                         );
                     let r = ui.add(edit);
+                    // オートフォーカス（17: 入力行オートフォーカス）。
+                    // rename 中または command_add_active 中はフォーカスを奪わず保留する。
+                    // それらが閉じた後のフレームで消化する（rename_focus_pending と同じパターン）。
+                    if state.ui.focus_input_pending
+                        && state.ui.rename_target.is_none()
+                        && !state.ui.command_add_active
+                    {
+                        r.request_focus();
+                        state.ui.focus_input_pending = false;
+                    }
                     // singleline は Enter でフォーカスを失うため、その瞬間は has_focus() が
                     // false になる。Enter は lost_focus() + キー押下で検出する（egui の定石）。
                     if r.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {

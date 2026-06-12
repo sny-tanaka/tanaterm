@@ -219,6 +219,12 @@ pub struct UiState {
     /// 追加フォームを開いた直後の 1 フレームだけ cmd 欄に focus を要求するフラグ。
     #[serde(skip)]
     pub command_add_focus_pending: bool,
+    /// 入力行 TextEdit へのフォーカス要求フラグ（17: 入力行オートフォーカス）。
+    /// 起動直後・セッション切替・新規作成・restart 後に true になり、
+    /// `central.rs::input_line` が `request_focus` を呼んで false に戻す。
+    /// rename 中または command_add_active 中はフラグを保留したまま消化しない。
+    #[serde(skip)]
+    pub focus_input_pending: bool,
     /// 表示中の toast（`ctx.input(|i| i.time)` 基準で TTL 経過後に消える）。
     #[serde(skip)]
     pub toast: Option<Toast>,
@@ -240,6 +246,7 @@ impl Default for UiState {
             command_add_cmd: String::new(),
             command_add_desc: String::new(),
             command_add_focus_pending: false,
+            focus_input_pending: false,
             toast: None,
         }
     }
@@ -426,6 +433,8 @@ impl AppState {
             ui: UiState {
                 active_session_id: Some(id.clone()),
                 shell,
+                // 起動直後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+                focus_input_pending: true,
                 ..UiState::default()
             },
             next_id: default_id_counter(),
@@ -540,6 +549,8 @@ impl AppState {
                 rail_right_visible: p.rail_right_visible,
                 shell: p.shell,
                 font_size,
+                // 起動直後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+                focus_input_pending: true,
                 ..UiState::default()
             },
             next_id,
@@ -592,6 +603,8 @@ impl AppState {
         }
         if self.sessions.iter().any(|s| s.id == id) {
             self.ui.active_session_id = Some(id.into());
+            // セッション切替後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+            self.ui.focus_input_pending = true;
         }
     }
 
@@ -621,6 +634,8 @@ impl AppState {
         };
         self.sessions.push(session);
         self.ui.active_session_id = Some(id.clone());
+        // 新規セッション作成後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+        self.ui.focus_input_pending = true;
         self.pending.push(PendingPty::Spawn {
             id: id.clone(),
             cwd: pwd,
@@ -913,6 +928,8 @@ impl AppState {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| s.pwd.clone());
+        // restart 後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+        self.ui.focus_input_pending = true;
         self.pending.push(PendingPty::Spawn {
             id: id.to_string(),
             cwd,
@@ -2475,5 +2492,32 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 17: focus_input_pending テスト ────────────────────────────────────
+
+    /// `focus_session` でフラグが立つこと。
+    #[test]
+    fn focus_session_sets_focus_input_pending() {
+        let mut s = fresh();
+        s.ui.focus_input_pending = false;
+        s.focus_session("s2");
+        assert!(s.ui.focus_input_pending, "focus_session でフラグが立つ");
+    }
+
+    /// `new_session` でフラグが立つこと。
+    #[test]
+    fn new_session_sets_focus_input_pending() {
+        let mut s = fresh();
+        s.ui.focus_input_pending = false;
+        s.new_session("test", "~/");
+        assert!(s.ui.focus_input_pending, "new_session でフラグが立つ");
+    }
+
+    /// `boot` でフラグが立つこと。
+    #[test]
+    fn boot_sets_focus_input_pending() {
+        let s = AppState::boot();
+        assert!(s.ui.focus_input_pending, "boot でフラグが立つ");
     }
 }
