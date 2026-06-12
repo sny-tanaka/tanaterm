@@ -1443,7 +1443,9 @@ mod seed {
             shelf_item("f4", "dotfiles", "~/.config", "personal", None, 60),
             shelf_item("f5", "notes", "~/notes", "personal", None, 21),
             shelf_item("f6", "downloads", "~/Downloads", "personal", None, 7),
-            shelf_item("f7", "prod logs", "/var/log", "remote", Some("prod-01"), 12),
+            // f7 (prod logs, /var/log, remote: prod-01) は削除済み。
+            // remote 接続は未実装のため、クリック時にローカルで /var/log を開くだけになり
+            // UI に "prod-01:" と表示されて誤解を招くため seed から外した（指示書14）。
             shelf_item("f8", "sandbox", "~/tmp/sandbox", "work", None, 3),
         ]
     }
