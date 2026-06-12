@@ -275,8 +275,9 @@ fn term_area(ui: &mut egui::Ui, state: &AppState) {
             // 最終ブロック後は hairline 無しで余白のみ（外枠の divider と二重に
             // ならないようにする）。
             let last = session.blocks.len().saturating_sub(1);
+            let font_size = state.ui.font_size;
             for (i, block) in session.blocks.iter().enumerate() {
-                draw_block(ui, block);
+                draw_block(ui, block, font_size);
                 if i != last {
                     ui.add_space(4.0);
                     block_divider(ui);
@@ -330,7 +331,7 @@ fn empty_placeholder(ui: &mut egui::Ui, session: &Session) {
     );
 }
 
-fn draw_block(ui: &mut egui::Ui, block: &Block) {
+fn draw_block(ui: &mut egui::Ui, block: &Block, font_size: f32) {
     let running = block.running;
     let err = matches!(block.exit_code, Some(c) if c != 0);
     let border = if running {
@@ -350,8 +351,8 @@ fn draw_block(ui: &mut egui::Ui, block: &Block) {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             prompt_line(ui, block);
-            cmd_line(ui, block, err);
-            output(ui, block);
+            cmd_line(ui, block, err, font_size);
+            output(ui, block, font_size);
         });
     });
 
@@ -400,18 +401,20 @@ fn prompt_line(ui: &mut egui::Ui, block: &Block) {
     });
 }
 
-fn cmd_line(ui: &mut egui::Ui, block: &Block, err: bool) {
+fn cmd_line(ui: &mut egui::Ui, block: &Block, err: bool, font_size: f32) {
+    // cmd_line は font_size + 0.5 で描画する（入力行の $ と比率を保つ）。
+    let cmd_fs = font_size + 0.5;
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("$")
                 .strong()
                 .color(theme::AMBER)
-                .size(13.0),
+                .size(cmd_fs),
         );
         ui.label(
             egui::RichText::new(&block.cmd)
                 .color(theme::FG_0)
-                .size(13.0),
+                .size(cmd_fs),
         );
         if err {
             if let Some(code) = block.exit_code {
@@ -460,15 +463,15 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
-fn output(ui: &mut egui::Ui, block: &Block) {
+fn output(ui: &mut egui::Ui, block: &Block, font_size: f32) {
     let mut layout = egui::text::LayoutJob::default();
     for span in &block.output {
-        push_span(&mut layout, span);
+        push_span(&mut layout, span, font_size);
     }
     ui.label(layout);
 }
 
-fn push_span(job: &mut egui::text::LayoutJob, span: &OutputSpan) {
+fn push_span(job: &mut egui::text::LayoutJob, span: &OutputSpan, font_size: f32) {
     let color = match span.color {
         OutputColor::Default => theme::FG_1,
         OutputColor::Sage => theme::SAGE,
@@ -482,7 +485,7 @@ fn push_span(job: &mut egui::text::LayoutJob, span: &OutputSpan) {
         &span.text,
         0.0,
         egui::TextFormat {
-            font_id: egui::FontId::monospace(12.5),
+            font_id: egui::FontId::monospace(font_size),
             color,
             ..Default::default()
         },
@@ -623,6 +626,8 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
     let busy_cmd: Option<String> = state
         .active()
         .and_then(|s| s.blocks.last().filter(|b| b.running).map(|b| b.cmd.clone()));
+    // 入力行フォントサイズ: font_size + 1.0（ブロック出力より 1pt 大きい）。
+    let input_fs = state.ui.font_size + 1.0;
     let mut buf = state
         .active_mut()
         .map(|s| std::mem::take(&mut s.input_buffer))
@@ -644,14 +649,14 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                     egui::RichText::new("$")
                         .strong()
                         .color(theme::AMBER)
-                        .size(13.5),
+                        .size(input_fs),
                 );
                 if shell_exited {
                     // シェル終了済み: TextEdit を表示せず restart 導線を表示する（08）。
                     ui.label(
                         egui::RichText::new("shell exited")
                             .color(theme::FG_2)
-                            .size(13.0),
+                            .size(input_fs),
                     );
                     ui.add_space(8.0);
                     // 「restart shell ↵」はクリック可能テキスト（amber）。
@@ -660,7 +665,7 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                             egui::Label::new(
                                 egui::RichText::new("restart shell ↵")
                                     .color(theme::AMBER)
-                                    .size(13.0),
+                                    .size(input_fs),
                             )
                             .sense(egui::Sense::click()),
                         )
@@ -683,9 +688,13 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                         .id(input_id())
                         .frame(false)
                         .text_color(theme::FG_0)
-                        .font(egui::FontId::monospace(13.5))
+                        .font(egui::FontId::monospace(input_fs))
                         .desired_width(ui.available_width() - 100.0)
-                        .hint_text(egui::RichText::new(hint).color(theme::FG_3).size(13.0));
+                        .hint_text(
+                            egui::RichText::new(hint)
+                                .color(theme::FG_3)
+                                .size(input_fs - 0.5),
+                        );
                     let r = ui.add(edit);
                     // singleline は Enter でフォーカスを失うため、その瞬間は has_focus() が
                     // false になる。Enter は lost_focus() + キー押下で検出する（egui の定石）。
@@ -710,7 +719,7 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                     ui.label(
                         egui::RichText::new("(no session)")
                             .color(theme::FG_3)
-                            .size(13.0),
+                            .size(input_fs),
                     );
                 }
 

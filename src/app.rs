@@ -178,10 +178,17 @@ impl TanaTermApp {
         let new_session = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T);
         let close_session = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
         let focus_search = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
+        // フォントズーム: ⌘+ / ⌘= → 拡大、⌘- → 縮小、⌘0 → リセット。
+        let zoom_in_plus = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Plus);
+        let zoom_in_eq = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Equals);
+        let zoom_out = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Minus);
+        let zoom_reset = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Num0);
 
         let mut do_new = false;
         let mut do_close = false;
         let mut do_focus_search = false;
+        let mut font_delta: f32 = 0.0;
+        let mut do_font_reset = false;
         ctx.input_mut(|i| {
             if i.consume_shortcut(&toggle_left) {
                 self.state.ui.rail_left_visible = !self.state.ui.rail_left_visible;
@@ -197,6 +204,16 @@ impl TanaTermApp {
             }
             if i.consume_shortcut(&focus_search) {
                 do_focus_search = true;
+            }
+            // フォントズーム。
+            if i.consume_shortcut(&zoom_in_plus) || i.consume_shortcut(&zoom_in_eq) {
+                font_delta += 1.0;
+            }
+            if i.consume_shortcut(&zoom_out) {
+                font_delta -= 1.0;
+            }
+            if i.consume_shortcut(&zoom_reset) {
+                do_font_reset = true;
             }
         });
 
@@ -217,6 +234,20 @@ impl TanaTermApp {
         }
         if do_focus_search {
             ctx.memory_mut(|m| m.request_focus(ui::topbar::search_id()));
+        }
+        // フォントサイズ変更（⌘+/−/0）。
+        if do_font_reset {
+            self.state.set_font_size(self.config.font_size);
+            let now = ctx.input(|i| i.time);
+            let size = self.state.ui.font_size as u32;
+            self.state
+                .show_toast(format!("font size: {size}"), None, now);
+        } else if font_delta != 0.0 {
+            self.state.adjust_font_size(font_delta);
+            let now = ctx.input(|i| i.time);
+            let size = self.state.ui.font_size as u32;
+            self.state
+                .show_toast(format!("font size: {size}"), None, now);
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -309,7 +340,6 @@ fn central_main_rect(ctx: &egui::Context, state: &AppState) -> egui::Rect {
 /// input 行の上に挟まる（≈ 40px）ぶんも差し引く。等幅フォントの 1 文字幅・行高を egui の
 /// フォントメトリクスから取り、最低サイズでクランプする。
 fn term_grid_size(ctx: &egui::Context, main_rect: egui::Rect, state: &AppState) -> (u16, u16) {
-    const FONT: f32 = 12.5;
     // term_head ≈ 44px、input 行（meta + 入力枠 + margin）≈ 96px。
     const RESERVED_BASE_H: f32 = 140.0;
     // running_card（frame + outer margin）≈ 40px。
@@ -323,7 +353,7 @@ fn term_grid_size(ctx: &egui::Context, main_rect: egui::Rect, state: &AppState) 
     };
 
     let (char_w, line_h) = ctx.fonts(|f| {
-        let font = egui::FontId::monospace(FONT);
+        let font = egui::FontId::monospace(state.ui.font_size);
         let w = f.glyph_width(&font, 'M').max(1.0);
         let h = f.row_height(&font).max(1.0);
         (w, h)
