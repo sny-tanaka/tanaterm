@@ -211,6 +211,9 @@ pub struct SgrConverter {
     esc: EscState,
     /// `ESC [` のパラメータ蓄積。
     params: Vec<u8>,
+    /// CSI 中間バイト（0x20–0x2F）を受け取ったことを示すフラグ。
+    /// 中間バイト付きシーケンスは終端が `m` でも SGR として解釈しない（ECMA-48 準拠）。
+    has_intermediate: bool,
     /// UTF-8 マルチバイト文字がチャンク境界で分断された場合の未確定バイト列。
     /// 次回 `convert()` 呼び出しで続きのバイトと連結して解釈する。
     pending: Vec<u8>,
@@ -269,18 +272,17 @@ impl SgrConverter {
                     if b == b'[' {
                         self.esc = EscState::Csi;
                         self.params.clear();
+                        self.has_intermediate = false;
                     } else {
                         // CSI 以外のエスケープ（`ESC ( B` 等）は 1 バイトで打ち切る簡易処理。
                         self.esc = EscState::Text;
                     }
                 }
                 EscState::Csi => {
-                    if (0x30..=0x3f).contains(&b) {
-                        // パラメータ / 中間バイト。
-                        self.params.push(b);
-                    } else {
-                        // 終端バイト（@..~）。`m` のみ SGR として解釈、他は読み飛ばす。
-                        if b == b'm' {
+                    if (0x40..=0x7e).contains(&b) {
+                        // 終端バイト（ECMA-48: 0x40–0x7E）。
+                        // 中間バイトが 1 つでもあった場合は SGR として解釈しない。
+                        if b == b'm' && !self.has_intermediate {
                             // pending を flush してから色を切り替える。
                             flush_pending_lossy(&mut self.pending, &mut buf);
                             push_span(&mut spans, &mut buf, self.color);
@@ -288,6 +290,18 @@ impl SgrConverter {
                         }
                         self.esc = EscState::Text;
                         self.params.clear();
+                        self.has_intermediate = false;
+                    } else if (0x20..=0x2f).contains(&b) {
+                        // 中間バイト（ECMA-48: 0x20–0x2F）。読み飛ばし、フラグを立てる。
+                        self.has_intermediate = true;
+                    } else if (0x30..=0x3f).contains(&b) {
+                        // パラメータバイト（ECMA-48: 0x30–0x3F）。
+                        self.params.push(b);
+                    } else {
+                        // 不正バイト（0x00–0x1F 等）は CSI を打ち切る。
+                        self.esc = EscState::Text;
+                        self.params.clear();
+                        self.has_intermediate = false;
                     }
                 }
             }
@@ -885,6 +899,37 @@ mod tests {
         assert!(
             text.chars().all(|ch| ch == '\u{FFFD}') && !text.is_empty(),
             "reset 後は前の pending が持ち越されず不正バイト扱いになる: {text:?}",
+        );
+    }
+
+    // ── 02: CSI 中間バイト誤終端修正テスト ────────────────────────────────────
+
+    /// DECSCUSR (ESC [ 0 SP q) の SP（中間バイト）で打ち切られ、`q` が混入しないこと。
+    #[test]
+    fn sgr_csi_intermediate_byte_not_output() {
+        let mut c = SgrConverter::new();
+        let spans = c.convert(b"a\x1b[0 qb");
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "ab", "q が出力に混入してはいけない: {text:?}");
+    }
+
+    /// 中間バイト付きの `ESC [ 1 SP m` は SGR として解釈されず、色が変わらないこと。
+    #[test]
+    fn sgr_csi_intermediate_m_not_treated_as_sgr() {
+        let mut c = SgrConverter::new();
+        // 最初に赤にする。
+        let _ = c.convert(b"\x1b[31m");
+        // 中間バイト付き `ESC [ 1 SP m` を送る（SGR 扱いされれば bold 色になるが、無視されるはず）。
+        let spans = c.convert(b"\x1b[1 m x");
+        // 色はリセットされず Rust のまま。
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains('x'), "テキスト 'x' が含まれる: {text:?}");
+        // 最後の span の色が Rust であること（中間バイト付き m で色変更されていない）。
+        let last_color = spans.last().map(|s| s.color);
+        assert_eq!(
+            last_color,
+            Some(OutputColor::Rust),
+            "中間バイト付き m は SGR 扱いしない: {spans:?}",
         );
     }
 }
