@@ -184,6 +184,10 @@ pub struct UiState {
     /// 入力行で切り替えるシェル（Phase 2 で実 PTY の起動シェルに反映）。
     #[serde(default)]
     pub shell: crate::config::Shell,
+    /// ターミナル本文のフォントサイズ（pt）。⌘+/− で変更、⌘0 で config 既定にリセット。
+    /// 8.0..=24.0 にクランプ。serde default は 13.0（起動時は Config.font_size で上書き）。
+    #[serde(default = "default_font_size")]
+    pub font_size: f32,
     /// TopBar グローバル検索の入力値。
     #[serde(skip)]
     pub search_query: String,
@@ -222,6 +226,7 @@ impl Default for UiState {
             rail_left_visible: true,
             rail_right_visible: true,
             shell: crate::config::Shell::default(),
+            font_size: default_font_size(),
             search_query: String::new(),
             rename_target: None,
             rename_buffer: String::new(),
@@ -284,6 +289,9 @@ pub struct PersistentState {
     pub rail_right_visible: bool,
     #[serde(default)]
     pub shell: crate::config::Shell,
+    /// ⌘+/− で変更したフォントサイズ。0.0 は「未保存」として boot 時の Config 値を使う。
+    #[serde(default)]
+    pub font_size: f32,
 }
 
 /// 永続化するセッションの最小情報（name / pwd / pinned）。blocks は復元しない。
@@ -298,6 +306,10 @@ pub struct PersistentSession {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_font_size() -> f32 {
+    13.0
 }
 
 /// アプリ全体の状態。Phase 1 ではこれを mock で埋めて UI を駆動する。
@@ -429,6 +441,7 @@ impl AppState {
             rail_left_visible: self.ui.rail_left_visible,
             rail_right_visible: self.ui.rail_right_visible,
             shell: self.ui.shell,
+            font_size: self.ui.font_size,
         }
     }
 
@@ -438,6 +451,10 @@ impl AppState {
         if p.sessions.is_empty() {
             let mut state = Self::boot();
             state.ui.shell = p.shell;
+            // font_size が 0.0 なら未保存（旧バージョンからの移行）なので default を使う。
+            if p.font_size > 0.0 {
+                state.ui.font_size = p.font_size;
+            }
             return state;
         }
 
@@ -493,6 +510,13 @@ impl AppState {
             })
             .collect();
 
+        // font_size が 0.0 なら未保存（旧バージョンからの移行）なので default を使う。
+        let font_size = if p.font_size > 0.0 {
+            p.font_size
+        } else {
+            default_font_size()
+        };
+
         Self {
             sessions,
             shelf: p.shelf,
@@ -502,6 +526,7 @@ impl AppState {
                 rail_left_visible: p.rail_left_visible,
                 rail_right_visible: p.rail_right_visible,
                 shell: p.shell,
+                font_size,
                 ..UiState::default()
             },
             next_id,
@@ -1130,6 +1155,17 @@ impl AppState {
         self.ui.rename_target = None;
         self.ui.rename_buffer.clear();
         self.ui.rename_focus_pending = false;
+    }
+
+    /// ターミナルフォントサイズを 8.0..=24.0 にクランプして設定する。
+    pub fn set_font_size(&mut self, size: f32) {
+        self.ui.font_size = size.clamp(8.0, 24.0);
+    }
+
+    /// 現在のフォントサイズに `delta` を加算して [`Self::set_font_size`] へ渡す。
+    pub fn adjust_font_size(&mut self, delta: f32) {
+        let new = self.ui.font_size + delta;
+        self.set_font_size(new);
     }
 
     /// Toast を 1 つ表示する。すでに表示中の Toast は置き換える。
@@ -2252,6 +2288,47 @@ mod tests {
         assert!(
             !s.active().unwrap().alt_screen,
             "EndBlock で alt_screen が false に戻る"
+        );
+    }
+
+    // ── 11: font_size クランプ / adjust テスト ───────────────────────────────
+
+    /// 下限（7.0 → 8.0）と上限（30.0 → 24.0）のクランプ。
+    #[test]
+    fn set_font_size_clamps_to_range() {
+        let mut s = fresh();
+        s.set_font_size(7.0);
+        assert_eq!(s.ui.font_size, 8.0, "下限 7.0 は 8.0 にクランプされる");
+        s.set_font_size(30.0);
+        assert_eq!(s.ui.font_size, 24.0, "上限 30.0 は 24.0 にクランプされる");
+    }
+
+    /// adjust_font_size: 加算・減算がクランプ込みで動く。
+    #[test]
+    fn adjust_font_size_adds_and_clamps() {
+        let mut s = fresh();
+        s.set_font_size(13.0);
+        s.adjust_font_size(1.0);
+        assert_eq!(s.ui.font_size, 14.0, "+1.0 → 14.0");
+        s.adjust_font_size(-3.0);
+        assert_eq!(s.ui.font_size, 11.0, "-3.0 → 11.0");
+        // 上限超え
+        s.set_font_size(23.0);
+        s.adjust_font_size(5.0);
+        assert_eq!(s.ui.font_size, 24.0, "上限超えはクランプ");
+    }
+
+    /// PersistentState 往復で font_size が保存・復元される。
+    #[test]
+    fn persistent_roundtrip_preserves_font_size() {
+        let mut s = fresh();
+        s.set_font_size(16.0);
+        let p = s.to_persistent();
+        assert_eq!(p.font_size, 16.0, "to_persistent に font_size が含まれる");
+        let restored = AppState::from_persistent(p);
+        assert_eq!(
+            restored.ui.font_size, 16.0,
+            "from_persistent で font_size が復元される"
         );
     }
 }
