@@ -83,6 +83,12 @@ impl OscScanner {
                         self.state = ScanState::Osc;
                         self.osc.clear();
                         i += 1;
+                    } else if b == 0x1b {
+                        // 連続 ESC（ESC ESC ...）の場合、先行 ESC を出力に積み、
+                        // Esc 状態を維持して次バイトで OSC か否かを判定する。
+                        out.push(0x1b);
+                        i += 1;
+                        // state は Esc のまま維持（`i` は進める）。
                     } else {
                         // OSC 以外のエスケープ。ESC ごと出力に戻して通常処理へ。
                         out.push(0x1b);
@@ -684,6 +690,23 @@ mod tests {
         let mut s = OscScanner::new();
         let ev = s.process(b"\x1b]7;file://host/a%20b\x07");
         assert_eq!(ev[0], BlockEvent::Cwd("/a b".into()));
+    }
+
+    // ── 03: ESC ESC ] で OSC を取りこぼさないことを確認するテスト ────────────
+
+    /// ESC ESC ] 133;C BEL の並びで CommandStart が得られ、Output には ESC 1 個だけが残る。
+    #[test]
+    fn scanner_esc_esc_osc_is_not_dropped() {
+        let mut s = OscScanner::new();
+        let ev = s.process(b"\x1b\x1b]133;C\x07");
+        // CommandStart が含まれる。
+        assert!(
+            ev.contains(&BlockEvent::CommandStart),
+            "CommandStart が得られること: {ev:?}",
+        );
+        // Output には先行 ESC 1 個だけが残る（2 個は残らない）。
+        let out = outputs(&ev);
+        assert_eq!(out, b"\x1b", "Output には ESC 1 個: {out:?}");
     }
 
     #[test]
