@@ -67,12 +67,16 @@ fn sessions_list(ui: &mut egui::Ui, state: &mut AppState) {
     let active_id = state.ui.active_session_id.clone();
     let last_idx = session_ids.len().saturating_sub(1);
 
+    // ScrollArea の外で確定した幅を渡す（widgets::row の不変条件）。
+    // -12.0 はスクロールバー幅控除。ScrollArea 内で available_width() を使うと
+    // SidePanel が content 幅に広がる正のフィードバックが発生するため。
+    let row_w = (ui.available_width() - 12.0).max(80.0);
+
     egui::ScrollArea::vertical()
         .id_source("rail_l_sessions_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
-            let row_w = (ui.available_width() - 12.0).max(80.0);
             for (i, id) in session_ids.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
@@ -204,12 +208,16 @@ fn shelf_list(ui: &mut egui::Ui, state: &mut AppState) {
     let ids: Vec<String> = state.shelf.iter().map(|s| s.id.clone()).collect();
     let last_idx = ids.len().saturating_sub(1);
 
+    // ScrollArea の外で確定した幅を渡す（widgets::row の不変条件）。
+    // -12.0 はスクロールバー幅控除。ScrollArea 内で available_width() を使うと
+    // SidePanel が content 幅に広がる正のフィードバックが発生するため。
+    let row_w = (ui.available_width() - 12.0).max(80.0);
+
     egui::ScrollArea::vertical()
         .id_source("rail_l_shelf_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
-            let row_w = (ui.available_width() - 12.0).max(80.0);
             for (i, id) in ids.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);

@@ -179,6 +179,10 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
     }
 
     let last_idx = ids.len().saturating_sub(1);
+    // ScrollArea の外で確定した幅を渡す（widgets::row の不変条件）。
+    // -12.0 はスクロールバー幅控除。ScrollArea 内で available_width() を使うと
+    // SidePanel が content 幅に広がる正のフィードバックが発生するため。
+    let row_w = (ui.available_width() - 12.0).max(80.0);
     egui::ScrollArea::vertical()
         .id_source(match section {
             Section::Pinned => "rail_r_pinned_scroll",
@@ -187,7 +191,6 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
         .auto_shrink([false, false]) // パネルの残り高さを埋める
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
-            let row_w = (ui.available_width() - 12.0).max(80.0);
             for (i, id) in ids.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
