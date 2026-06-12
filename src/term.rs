@@ -211,6 +211,9 @@ pub struct SgrConverter {
     esc: EscState,
     /// `ESC [` のパラメータ蓄積。
     params: Vec<u8>,
+    /// UTF-8 マルチバイト文字がチャンク境界で分断された場合の未確定バイト列。
+    /// 次回 `convert()` 呼び出しで続きのバイトと連結して解釈する。
+    pending: Vec<u8>,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -233,21 +236,34 @@ impl SgrConverter {
         self.color = OutputColor::Default;
         self.esc = EscState::Text;
         self.params.clear();
+        // ブロック跨ぎの UTF-8 未確定バイトも破棄する。
+        self.pending.clear();
     }
 
     /// 素バイト列を `OutputSpan` 列に変換する。同色は 1 span にまとめる。
     pub fn convert(&mut self, bytes: &[u8]) -> Vec<OutputSpan> {
         let mut spans: Vec<OutputSpan> = Vec::new();
         let mut buf = String::new();
-        let mut pending: Vec<u8> = Vec::new(); // UTF-8 のマルチバイト境界対策
 
         for &b in bytes {
             match self.esc {
                 EscState::Text => match b {
-                    0x1b => self.esc = EscState::Esc,
-                    b'\r' => {} // CRLF→LF 相当。素の \r は破棄する。
-                    0x07 => {}  // BEL は無視。
-                    _ => pending.push(b),
+                    0x1b => {
+                        // ESC は ASCII であり、正規 UTF-8 マルチバイト途中には現れない。
+                        // ここで pending に未確定バイトが残っていれば不正入力として lossy flush。
+                        flush_pending_lossy(&mut self.pending, &mut buf);
+                        self.esc = EscState::Esc;
+                    }
+                    b'\r' => {
+                        // CRLF→LF 相当。素の \r は破棄する。
+                        // \r も ASCII なので pending を lossy flush してから捨てる。
+                        flush_pending_lossy(&mut self.pending, &mut buf);
+                    }
+                    0x07 => {
+                        // BEL は無視。ASCII なので同様に pending を lossy flush。
+                        flush_pending_lossy(&mut self.pending, &mut buf);
+                    }
+                    _ => self.pending.push(b),
                 },
                 EscState::Esc => {
                     if b == b'[' {
@@ -266,7 +282,7 @@ impl SgrConverter {
                         // 終端バイト（@..~）。`m` のみ SGR として解釈、他は読み飛ばす。
                         if b == b'm' {
                             // pending を flush してから色を切り替える。
-                            flush_pending(&mut pending, &mut buf);
+                            flush_pending_lossy(&mut self.pending, &mut buf);
                             push_span(&mut spans, &mut buf, self.color);
                             self.color = apply_sgr(self.color, &self.params);
                         }
@@ -277,19 +293,74 @@ impl SgrConverter {
             }
         }
 
-        flush_pending(&mut pending, &mut buf);
+        // チャンク末尾で完全な UTF-8 になっている部分だけを buf に取り込み、
+        // 不完全な末尾バイト列は self.pending に残して次回 convert() に持ち越す。
+        flush_pending_partial(&mut self.pending, &mut buf);
         push_span(&mut spans, &mut buf, self.color);
         spans
     }
 }
 
-/// pending（生バイト）を UTF-8 として buf に取り込む。不正バイトは置換文字になる。
-fn flush_pending(pending: &mut Vec<u8>, buf: &mut String) {
+/// pending（生バイト）を UTF-8 として buf に lossy で取り込む。不正バイトは置換文字になる。
+///
+/// ESC / \r / BEL 等の ASCII が届いた時点で呼ぶ（正規マルチバイト途中には現れないため、
+/// その時点で pending に残っているバイト列は不正入力とみなしてよい）。
+fn flush_pending_lossy(pending: &mut Vec<u8>, buf: &mut String) {
     if pending.is_empty() {
         return;
     }
     buf.push_str(&String::from_utf8_lossy(pending));
     pending.clear();
+}
+
+/// pending（生バイト）を UTF-8 として buf に取り込む。
+///
+/// 先頭から完全な UTF-8 として解釈できる部分だけを buf に書き込み、
+/// チャンク末尾で途切れた不完全バイト列は pending に残す。
+/// 途中に明確な不正バイトがある場合は置換文字（U+FFFD）を 1 つ push し、
+/// そのバイトを捨ててループ継続する。
+fn flush_pending_partial(pending: &mut Vec<u8>, buf: &mut String) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut start = 0;
+    loop {
+        match std::str::from_utf8(&pending[start..]) {
+            Ok(s) => {
+                // 全バイト有効。
+                buf.push_str(s);
+                pending.clear();
+                return;
+            }
+            Err(e) => {
+                // 有効部分を先に flush。
+                let valid_end = start + e.valid_up_to();
+                if valid_end > start {
+                    // Safety: valid_up_to() は UTF-8 境界を保証する。
+                    buf.push_str(unsafe {
+                        std::str::from_utf8_unchecked(&pending[start..valid_end])
+                    });
+                }
+                match e.error_len() {
+                    None => {
+                        // 末尾で切れている（不完全マルチバイト）。次回に持ち越す。
+                        pending.drain(..valid_end);
+                        return;
+                    }
+                    Some(n) => {
+                        // 明確な不正バイト列。置換文字を 1 つ push して n バイト捨てる。
+                        buf.push('\u{FFFD}');
+                        start = valid_end + n;
+                        if start >= pending.len() {
+                            pending.clear();
+                            return;
+                        }
+                        // ループ継続（残りバイトを処理）。
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// buf に溜まったテキストを 1 span にして push し、buf を空にする。
@@ -741,5 +812,79 @@ mod tests {
             "EndBlock してはいけない: {actions:?}",
         );
         assert!(actions.contains(&TermAction::ClearOutput));
+    }
+
+    // ── 01: UTF-8 チャンク境界文字化け修正テスト ──────────────────────────────
+
+    /// 「こんにちは」を 1 バイト目直後で 2 チャンクに分断しても文字化けしない。
+    #[test]
+    fn sgr_utf8_split_after_first_byte() {
+        let mut c = SgrConverter::new();
+        // "こ" = 0xe3 0x81 0x93。1 バイト目（0xe3）だけ先に届く。
+        let konnnichiwa = "こんにちは".as_bytes();
+        let (first, rest) = konnnichiwa.split_at(1);
+        let s1 = c.convert(first);
+        let s2 = c.convert(rest);
+        let text: String = s1
+            .iter()
+            .chain(s2.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "置換文字が含まれてはいけない: {text:?}",
+        );
+        assert_eq!(text, "こんにちは");
+    }
+
+    /// 「こんにちは」を 2 バイト目直後で 2 チャンクに分断しても文字化けしない。
+    #[test]
+    fn sgr_utf8_split_after_second_byte() {
+        let mut c = SgrConverter::new();
+        // "こ" = 0xe3 0x81 0x93。2 バイト目（0x81）まで先に届く。
+        let konnnichiwa = "こんにちは".as_bytes();
+        let (first, rest) = konnnichiwa.split_at(2);
+        let s1 = c.convert(first);
+        let s2 = c.convert(rest);
+        let text: String = s1
+            .iter()
+            .chain(s2.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "置換文字が含まれてはいけない: {text:?}",
+        );
+        assert_eq!(text, "こんにちは");
+    }
+
+    /// 単独の不正バイト（0xff）は置換文字になる。
+    #[test]
+    fn sgr_invalid_byte_becomes_replacement_char() {
+        let mut c = SgrConverter::new();
+        let spans = c.convert(b"\xff");
+        // convert() の末尾では partial flush するが、0xff は error_len=Some(1) なので
+        // 即座に FFFD に変換される。
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "\u{FFFD}");
+    }
+
+    /// reset() 後に保持バイトが持ち越されない。
+    #[test]
+    fn sgr_reset_clears_pending_bytes() {
+        let mut c = SgrConverter::new();
+        // "こ" の 1 バイト目だけ渡す（pending に残る）。
+        let _ = c.convert(&"こ".as_bytes()[..1]);
+        // reset() で pending を破棄する。
+        c.reset();
+        // reset 後に残りバイトを渡しても前の未確定バイトとは連結されず独立して処理される。
+        // "こ" の 2〜3 バイト目（0x81 0x93）は 1 バイト目なしでは不正 → FFFD になる。
+        // 各バイトが個別に不正となるため FFFD が 1 個以上出る。
+        let spans = c.convert(&"こ".as_bytes()[1..]);
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            text.chars().all(|ch| ch == '\u{FFFD}') && !text.is_empty(),
+            "reset 後は前の pending が持ち越されず不正バイト扱いになる: {text:?}",
+        );
     }
 }
