@@ -107,6 +107,11 @@ pub struct Session {
     /// 履歴ブラウズ中の位置。`None` = 新規入力中、`Some(i)` = `history[i]` を編集中。
     #[serde(skip)]
     pub history_cursor: Option<usize>,
+    /// alternate screen（vim / less 等）が表示中か（07: alt-screen 検知）。
+    /// `true` の間は `Append` / `OverwriteLine` / `AppendDetached` を無視する。
+    /// `EndBlock` 時に false に戻す（leave シーケンス取りこぼし保険）。
+    #[serde(skip)]
+    pub alt_screen: bool,
 }
 
 /// Shelf に登録された "お気に入りディレクトリ"。
@@ -384,6 +389,7 @@ impl AppState {
             input_buffer: String::new(),
             history: Vec::new(),
             history_cursor: None,
+            alt_screen: false,
         };
         Self {
             sessions: vec![session],
@@ -445,6 +451,7 @@ impl AppState {
                 input_buffer: String::new(),
                 history: Vec::new(),
                 history_cursor: None,
+                alt_screen: false,
             })
             .collect();
 
@@ -561,6 +568,7 @@ impl AppState {
             input_buffer: String::new(),
             history: Vec::new(),
             history_cursor: None,
+            alt_screen: false,
         };
         self.sessions.push(session);
         self.ui.active_session_id = Some(id.clone());
@@ -724,8 +732,17 @@ impl AppState {
     /// PTY 由来の [`crate::term::TermAction`] を該当セッションに適用する。
     pub fn apply_term_action(&mut self, id: &str, action: crate::term::TermAction) {
         use crate::term::TermAction;
+        // alt_screen 中は Append / OverwriteLine / AppendDetached を無視する（07）。
+        let is_alt_screen = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.alt_screen);
         match action {
             TermAction::Append(spans) => {
+                if is_alt_screen {
+                    return;
+                }
                 if let Some(b) = self.running_block_mut(id) {
                     b.output.extend(spans);
                 }
@@ -736,6 +753,10 @@ impl AppState {
                 }
             }
             TermAction::EndBlock { exit } => {
+                // EndBlock 時は alt_screen を false に戻す（leave 取りこぼし保険）。
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    s.alt_screen = false;
+                }
                 if let Some(b) = self.running_block_mut(id) {
                     b.running = false;
                     b.exit_code = exit;
@@ -749,7 +770,50 @@ impl AppState {
                 }
             }
             TermAction::SetCwd(path) => self.set_session_cwd(id, &path),
+            TermAction::OverwriteLine => {
+                if is_alt_screen {
+                    return;
+                }
+                if let Some(b) = self.running_block_mut(id) {
+                    truncate_after_last_newline(&mut b.output);
+                }
+            }
+            TermAction::AppendDetached(spans) => {
+                if is_alt_screen {
+                    return;
+                }
+                let session = self.sessions.iter_mut().find(|s| s.id == id);
+                let Some(session) = session else { return };
+                let Some(last_block) = session.blocks.last_mut() else {
+                    return; // ブロックが 0 件なら捨てる。
+                };
+                // 末尾ブロックの出力が改行で終わっていなければ先頭に `\n` を補う。
+                let needs_newline = last_block
+                    .output
+                    .last()
+                    .is_some_and(|s| !s.text.ends_with('\n'));
+                if needs_newline {
+                    last_block.output.push(OutputSpan {
+                        color: OutputColor::Dim,
+                        text: "\n".to_string(),
+                    });
+                }
+                last_block.output.extend(spans);
+            }
+            TermAction::AltScreen(b) => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    s.alt_screen = b;
+                }
+            }
         }
+    }
+
+    /// alternate screen が表示中かどうかを返す。`central.rs` のバナー表示に使う。
+    pub fn is_alt_screen(&self, id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.alt_screen)
     }
 
     /// シェルが終了（チャンネル切断）したセッションを Idle にし、実行中ブロックを閉じる。
@@ -1065,6 +1129,31 @@ impl AppState {
     }
 }
 
+/// `\r` 上書き（プログレスバー）用: ブロック出力の最終行（最後の `'\n'` より後ろ）を削る。
+///
+/// - span を末尾から走査し、`'\n'` を含む span を見つけたらその span 内の
+///   最後の `'\n'` 直後まで残して切り詰める。
+/// - `'\n'` が見つからないまま先頭に達したら output 全体をクリアする。
+/// - 空になった span は除去する。
+pub(crate) fn truncate_after_last_newline(output: &mut Vec<OutputSpan>) {
+    // 末尾から \n を探す。
+    let len = output.len();
+    for i in (0..len).rev() {
+        if let Some(pos) = output[i].text.rfind('\n') {
+            // この span の最後の \n 直後まで残す。
+            output[i].text.truncate(pos + 1);
+            // それより後ろの span を全て削除する。
+            output.truncate(i + 1);
+            // text が空になった span（\n だけなら空にならないが念のため）を除去する。
+            // ただし \n を含む場合はその span は残す（text = "\n" は空でない）。
+            output.retain(|s| !s.text.is_empty());
+            return;
+        }
+    }
+    // \n が見つからない → output 全体をクリア（最初の行だけで上書きが始まるケース）。
+    output.clear();
+}
+
 /// `tanaterm-data.jsx` の INITIAL_* に対応する seed データ。
 mod seed {
     #[cfg(test)]
@@ -1151,6 +1240,7 @@ mod seed {
                 input_buffer: String::new(),
                 history: vec!["ls -la".into(), "pnpm typecheck".into(), "pnpm dev".into()],
                 history_cursor: None,
+                alt_screen: false,
             },
             Session {
                 id: "s2".into(),
@@ -1174,6 +1264,7 @@ mod seed {
                 input_buffer: String::new(),
                 history: vec!["docker compose logs -f api".into()],
                 history_cursor: None,
+                alt_screen: false,
             },
             Session {
                 id: "s3".into(),
@@ -1188,6 +1279,7 @@ mod seed {
                 input_buffer: String::new(),
                 history: Vec::new(),
                 history_cursor: None,
+                alt_screen: false,
             },
             Session {
                 id: "s4".into(),
@@ -1202,6 +1294,7 @@ mod seed {
                 input_buffer: String::new(),
                 history: Vec::new(),
                 history_cursor: None,
+                alt_screen: false,
             },
             Session {
                 id: "s5".into(),
@@ -1216,6 +1309,7 @@ mod seed {
                 input_buffer: String::new(),
                 history: Vec::new(),
                 history_cursor: None,
+                alt_screen: false,
             },
         ]
     }
@@ -1820,5 +1914,207 @@ mod tests {
         assert_eq!(s.shelf.len(), before + 1);
         assert_eq!(s.shelf.last().unwrap().label, "tanaterm");
         assert_eq!(s.shelf.last().unwrap().path, "~/work/tanaterm");
+    }
+
+    // ── 04: truncate_after_last_newline テスト ─────────────────────────────────
+
+    /// 複数 span に \n が含まれる場合、最後の \n 直後まで残してそれ以降を削る。
+    #[test]
+    fn truncate_after_last_newline_multi_span() {
+        use crate::state::truncate_after_last_newline;
+        let mut output = vec![
+            OutputSpan {
+                color: OutputColor::Default,
+                text: "x\n".to_string(),
+            },
+            OutputSpan {
+                color: OutputColor::Default,
+                text: "y".to_string(),
+            },
+        ];
+        truncate_after_last_newline(&mut output);
+        // "x\n" までが残り "y" は削除される。
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].text, "x\n");
+    }
+
+    /// 単一 span で \n なし → output 全体クリア。
+    #[test]
+    fn truncate_after_last_newline_no_newline_clears() {
+        use crate::state::truncate_after_last_newline;
+        let mut output = vec![OutputSpan {
+            color: OutputColor::Default,
+            text: "abc".to_string(),
+        }];
+        truncate_after_last_newline(&mut output);
+        assert!(output.is_empty(), "\\n なし → output クリア");
+    }
+
+    /// span 内の最後の \n 直後で切り詰める（span 途中の \n）。
+    #[test]
+    fn truncate_after_last_newline_cuts_within_span() {
+        use crate::state::truncate_after_last_newline;
+        let mut output = vec![OutputSpan {
+            color: OutputColor::Default,
+            text: "line1\nline2".to_string(),
+        }];
+        truncate_after_last_newline(&mut output);
+        // "line1\n" まで残る。
+        assert_eq!(output[0].text, "line1\n");
+    }
+
+    // ── 04: OverwriteLine state テスト ────────────────────────────────────────
+
+    /// 実行中ブロック出力が "x\ny" で OverwriteLine → "x\n" になる。
+    #[test]
+    fn apply_term_action_overwrite_line() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "echo".into();
+        }
+        s.submit_input("12:00".into());
+        s.apply_term_action(
+            "s3",
+            TermAction::Append(vec![
+                OutputSpan {
+                    color: OutputColor::Default,
+                    text: "x\n".into(),
+                },
+                OutputSpan {
+                    color: OutputColor::Default,
+                    text: "y".into(),
+                },
+            ]),
+        );
+        s.apply_term_action("s3", TermAction::OverwriteLine);
+        let block = s.active().unwrap().blocks.last().unwrap();
+        let text: String = block.output.iter().map(|sp| sp.text.as_str()).collect();
+        assert_eq!(text, "x\n", "OverwriteLine 後は 'x\\n' のみ残る");
+    }
+
+    // ── 05: AppendDetached state テスト ───────────────────────────────────────
+
+    /// ブロックが存在する時に AppendDetached が最終ブロックへ Dim で追記される。
+    #[test]
+    fn apply_term_action_append_detached_to_last_block() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "sleep 5 &".into();
+        }
+        s.submit_input("12:00".into());
+        // ブロックを完了状態にする。
+        s.apply_term_action("s3", TermAction::EndBlock { exit: Some(0) });
+        // AppendDetached を適用する。
+        s.apply_term_action(
+            "s3",
+            TermAction::AppendDetached(vec![OutputSpan {
+                color: OutputColor::Dim,
+                text: "[1]  + done sleep 5\n".into(),
+            }]),
+        );
+        let block = s.active().unwrap().blocks.last().unwrap();
+        let text: String = block.output.iter().map(|sp| sp.text.as_str()).collect();
+        assert!(
+            text.contains("[1]  + done sleep 5"),
+            "AppendDetached が最終ブロックへ追記される: {text:?}",
+        );
+        // Dim 色であること。
+        assert!(
+            block
+                .output
+                .last()
+                .is_some_and(|sp| sp.color == OutputColor::Dim),
+            "AppendDetached は Dim 色: {:?}",
+            block.output.last(),
+        );
+    }
+
+    /// ブロック 0 件では AppendDetached が何もしない。
+    #[test]
+    fn apply_term_action_append_detached_no_blocks_noop() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3"); // s3 は blocks: Vec::new()
+        let block_count = s.active().unwrap().blocks.len();
+        s.apply_term_action(
+            "s3",
+            TermAction::AppendDetached(vec![OutputSpan {
+                color: OutputColor::Dim,
+                text: "orphan\n".into(),
+            }]),
+        );
+        assert_eq!(
+            s.active().unwrap().blocks.len(),
+            block_count,
+            "ブロック 0 件では何も起きない",
+        );
+    }
+
+    // ── 07: AltScreen state テスト ────────────────────────────────────────────
+
+    /// AltScreen(true) 中の Append が無視される。
+    #[test]
+    fn apply_term_action_alt_screen_suppresses_append() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "vim".into();
+        }
+        s.submit_input("12:00".into());
+        // AltScreen に入る。
+        s.apply_term_action("s3", TermAction::AltScreen(true));
+        // この Append は無視されるはず。
+        s.apply_term_action(
+            "s3",
+            TermAction::Append(vec![OutputSpan {
+                color: OutputColor::Default,
+                text: "vim output".into(),
+            }]),
+        );
+        let block = s.active().unwrap().blocks.last().unwrap();
+        assert!(
+            block.output.is_empty(),
+            "AltScreen 中は Append が無視される"
+        );
+
+        // AltScreen(false) で解除後は Append が届く。
+        s.apply_term_action("s3", TermAction::AltScreen(false));
+        s.apply_term_action(
+            "s3",
+            TermAction::Append(vec![OutputSpan {
+                color: OutputColor::Default,
+                text: "after vim".into(),
+            }]),
+        );
+        let block = s.active().unwrap().blocks.last().unwrap();
+        let text: String = block.output.iter().map(|sp| sp.text.as_str()).collect();
+        assert_eq!(text, "after vim", "AltScreen 解除後は Append が届く");
+    }
+
+    /// EndBlock で alt_screen が false に戻る。
+    #[test]
+    fn apply_term_action_end_block_resets_alt_screen() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "vim".into();
+        }
+        s.submit_input("12:00".into());
+        s.apply_term_action("s3", TermAction::AltScreen(true));
+        assert!(
+            s.active().unwrap().alt_screen,
+            "AltScreen true にセットされる"
+        );
+        s.apply_term_action("s3", TermAction::EndBlock { exit: Some(0) });
+        assert!(
+            !s.active().unwrap().alt_screen,
+            "EndBlock で alt_screen が false に戻る"
+        );
     }
 }

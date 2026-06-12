@@ -26,10 +26,19 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             egui::TopBottomPanel::bottom("input_row")
                 .frame(egui::Frame::none().fill(theme::BG_0))
                 .show_inside(ui, |ui| input_row(ui, state));
-            // running_card は busy 時のみ存在。input_row より後に show すると input_row の
-            // すぐ上に積まれる（egui の bottom panel は show 順に下から積む）。スクロール
-            // 領域から実行中ブロックが流れて見えなくなっても、ここに必ず残る（Warp 風）。
-            if has_running(state) {
+            // alt_screen バナーは running_card より優先して表示する（07: alt-screen 検知）。
+            // input_row より後に show するので、input_row のすぐ上に積まれる。
+            let session_id = state.ui.active_session_id.clone();
+            let is_alt = session_id
+                .as_deref()
+                .is_some_and(|id| state.is_alt_screen(id));
+            if is_alt {
+                egui::TopBottomPanel::bottom("alt_screen_banner")
+                    .frame(egui::Frame::none().fill(theme::BG_1))
+                    .show_separator_line(false)
+                    .show_inside(ui, alt_screen_banner);
+            } else if has_running(state) {
+                // running_card は busy 時のみ存在。alt_screen 中は表示しない。
                 egui::TopBottomPanel::bottom("running_card")
                     .frame(egui::Frame::none().fill(theme::BG_1))
                     .show_separator_line(false)
@@ -39,6 +48,59 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none().fill(theme::BG_1))
                 .show_inside(ui, |ui| term_area(ui, state));
         });
+}
+
+/// alternate screen（vim / less / htop 等の全画面 TUI）中のバナー（07: alt-screen 検知）。
+///
+/// running_card と同じ位置・形式（bottom panel、amber 枠）で表示する。
+/// 入力行は通常どおり機能する（busy 中なので stdin 送信になる）。
+fn alt_screen_banner(ui: &mut egui::Ui) {
+    egui::Frame::none()
+        .fill(theme::BG_2)
+        .stroke(egui::Stroke::new(1.0, theme::AMBER.gamma_multiply(0.45)))
+        .rounding(8.0)
+        .inner_margin(egui::Margin {
+            left: 12.0,
+            right: 12.0,
+            top: 8.0,
+            bottom: 8.0,
+        })
+        .outer_margin(egui::Margin {
+            left: 12.0,
+            right: 12.0,
+            top: 0.0,
+            bottom: 6.0,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let now = ui.input(|i| i.time);
+                // 縦バーを pulse させて視線を引く（running_card と同じスタイル）。
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(3.0, 16.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    bar_rect,
+                    1.5,
+                    theme::AMBER.gamma_multiply(widgets::pulse_opacity(now)),
+                );
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new("interactive app")
+                        .color(theme::AMBER)
+                        .size(13.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("— 画面描画は非対応です（q 等で終了してください）")
+                        .color(theme::FG_2)
+                        .size(12.0),
+                );
+            });
+        });
+    // フレーム更新を要求してバーの pulse を動かし続ける。
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(40));
 }
 
 /// アクティブセッションの直近ブロックが実行中なら true。

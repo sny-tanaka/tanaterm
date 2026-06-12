@@ -137,7 +137,12 @@ impl TanaTermApp {
                     );
                 }
                 PendingPty::Send { id, bytes } => {
-                    self.pty.on_submit(&id);
+                    // bytes から末尾の \n を除いた UTF-8 文字列をコマンドとして渡す（06）。
+                    let cmd = std::str::from_utf8(&bytes)
+                        .unwrap_or("")
+                        .trim_end_matches('\n')
+                        .to_string();
+                    self.pty.on_submit(&id, &cmd);
                     self.pty.send(&id, &bytes);
                 }
                 PendingPty::SendRaw { id, bytes } => {

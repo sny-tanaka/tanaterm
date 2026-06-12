@@ -69,9 +69,10 @@ impl PtyManager {
     }
 
     /// 入力行からの送信前に呼ぶ（ブロック取り込み状態の初期化）。
-    pub fn on_submit(&mut self, id: &str) {
+    /// `cmd` は Auto モードのエコー除去用（06: heuristic echo strip）。
+    pub fn on_submit(&mut self, id: &str, cmd: &str) {
         if let Some(h) = self.handles.get_mut(id) {
-            h.term.on_submit();
+            h.term.on_submit(cmd);
         }
     }
 
@@ -289,7 +290,7 @@ mod tests {
         // シェル初期化（最初のプロンプト）を待ってからコマンドを送る。
         std::thread::sleep(std::time::Duration::from_millis(800));
         let _ = mgr.drain("t1");
-        mgr.on_submit("t1");
+        mgr.on_submit("t1", "echo tanaterm_marker");
         mgr.send("t1", b"echo tanaterm_marker\n");
 
         let mut text = String::new();

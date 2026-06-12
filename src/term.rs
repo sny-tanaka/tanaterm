@@ -206,10 +206,22 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// ANSI(SGR) を `OutputColor` に解釈しつつ、素バイト列を `OutputSpan` 列へ変換する。
+/// SGR 変換の論理イベント。テキスト span 列と行上書き（\r 単独）の区別。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SgrEvent {
+    /// テキスト span 列。
+    Spans(Vec<OutputSpan>),
+    /// \r 単独（CRLF ではない）。「現在行の先頭へ戻る」= 直前行の上書き開始。
+    CarriageReturn,
+    /// alternate screen の切替。`true` = 入り（h）、`false` = 出る（l）。
+    AltScreen(bool),
+}
+
+/// ANSI(SGR) を `OutputColor` に解釈しつつ、素バイト列を `SgrEvent` 列へ変換する。
 ///
 /// ブロックをまたいで現在色を保つので、ブロック単位で 1 つ持ち、`CommandStart` で
-/// リセットする。`\r` は破棄（CRLF→LF 相当）し、色以外の CSI は読み飛ばす。
+/// リセットする。色以外の CSI は読み飛ばす（ただし alternate screen CSI は
+/// `SgrEvent::AltScreen` として通知する）。
 #[derive(Default)]
 pub struct SgrConverter {
     color: OutputColor,
@@ -223,6 +235,10 @@ pub struct SgrConverter {
     /// UTF-8 マルチバイト文字がチャンク境界で分断された場合の未確定バイト列。
     /// 次回 `convert()` 呼び出しで続きのバイトと連結して解釈する。
     pending: Vec<u8>,
+    /// チャンク末尾が `\r` で終わった場合の持ち越しフラグ。
+    /// 次チャンク先頭が `\n` なら CRLF として改行のみ発行し、それ以外なら
+    /// `CarriageReturn` を先に発行してからそのバイトを処理する。
+    cr_pending: bool,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -247,14 +263,46 @@ impl SgrConverter {
         self.params.clear();
         // ブロック跨ぎの UTF-8 未確定バイトも破棄する。
         self.pending.clear();
+        self.cr_pending = false;
     }
 
-    /// 素バイト列を `OutputSpan` 列に変換する。同色は 1 span にまとめる。
-    pub fn convert(&mut self, bytes: &[u8]) -> Vec<OutputSpan> {
+    /// 素バイト列を `SgrEvent` 列に変換する。同色は 1 span にまとめる。
+    pub fn convert(&mut self, bytes: &[u8]) -> Vec<SgrEvent> {
+        let mut events: Vec<SgrEvent> = Vec::new();
         let mut spans: Vec<OutputSpan> = Vec::new();
         let mut buf = String::new();
 
-        for &b in bytes {
+        // cr_pending 持ち越し処理: チャンク先頭バイトで CRLF か素の CR かを判定する。
+        if self.cr_pending {
+            self.cr_pending = false;
+            if bytes.first() == Some(&b'\n') {
+                // CRLF → \n として扱う（buf に改行を積んで残りを処理）。
+                buf.push('\n');
+                // 残りのバイトを処理するため bytes の先頭を 1 つ skip する。
+                return self.convert_inner(&bytes[1..], events, spans, buf);
+            } else {
+                // 素の CR → CarriageReturn を先に発行。
+                push_span(&mut spans, &mut buf, self.color);
+                flush_spans(&mut events, &mut spans);
+                events.push(SgrEvent::CarriageReturn);
+                // 続けて bytes 全体を処理。
+                return self.convert_inner(bytes, events, spans, buf);
+            }
+        }
+
+        self.convert_inner(bytes, events, spans, buf)
+    }
+
+    fn convert_inner(
+        &mut self,
+        bytes: &[u8],
+        mut events: Vec<SgrEvent>,
+        mut spans: Vec<OutputSpan>,
+        mut buf: String,
+    ) -> Vec<SgrEvent> {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
             match self.esc {
                 EscState::Text => match b {
                     0x1b => {
@@ -262,17 +310,37 @@ impl SgrConverter {
                         // ここで pending に未確定バイトが残っていれば不正入力として lossy flush。
                         flush_pending_lossy(&mut self.pending, &mut buf);
                         self.esc = EscState::Esc;
+                        i += 1;
                     }
                     b'\r' => {
-                        // CRLF→LF 相当。素の \r は破棄する。
-                        // \r も ASCII なので pending を lossy flush してから捨てる。
+                        // \r も ASCII なので pending を lossy flush する。
                         flush_pending_lossy(&mut self.pending, &mut buf);
+                        // 次バイトを先読みして CRLF か素の CR かを判定する。
+                        if bytes.get(i + 1) == Some(&b'\n') {
+                            // CRLF → 改行として扱う（CarriageReturn は出さない）。
+                            buf.push('\n');
+                            i += 2; // \r と \n を両方消費する。
+                        } else if i + 1 < bytes.len() {
+                            // 素の CR（次バイトは \n でない）。
+                            push_span(&mut spans, &mut buf, self.color);
+                            flush_spans(&mut events, &mut spans);
+                            events.push(SgrEvent::CarriageReturn);
+                            i += 1;
+                        } else {
+                            // チャンク末尾が \r → 次チャンクで判定を繰り越す。
+                            self.cr_pending = true;
+                            i += 1;
+                        }
                     }
                     0x07 => {
                         // BEL は無視。ASCII なので同様に pending を lossy flush。
                         flush_pending_lossy(&mut self.pending, &mut buf);
+                        i += 1;
                     }
-                    _ => self.pending.push(b),
+                    _ => {
+                        self.pending.push(b);
+                        i += 1;
+                    }
                 },
                 EscState::Esc => {
                     if b == b'[' {
@@ -283,16 +351,24 @@ impl SgrConverter {
                         // CSI 以外のエスケープ（`ESC ( B` 等）は 1 バイトで打ち切る簡易処理。
                         self.esc = EscState::Text;
                     }
+                    i += 1;
                 }
                 EscState::Csi => {
                     if (0x40..=0x7e).contains(&b) {
                         // 終端バイト（ECMA-48: 0x40–0x7E）。
-                        // 中間バイトが 1 つでもあった場合は SGR として解釈しない。
                         if b == b'm' && !self.has_intermediate {
                             // pending を flush してから色を切り替える。
                             flush_pending_lossy(&mut self.pending, &mut buf);
                             push_span(&mut spans, &mut buf, self.color);
                             self.color = apply_sgr(self.color, &self.params);
+                        } else if (b == b'h' || b == b'l') && !self.has_intermediate {
+                            // alternate screen CSI: params が `?` で始まり、1049/1047/47 を含む。
+                            if let Some(alt) = detect_alt_screen(&self.params, b) {
+                                flush_pending_lossy(&mut self.pending, &mut buf);
+                                push_span(&mut spans, &mut buf, self.color);
+                                flush_spans(&mut events, &mut spans);
+                                events.push(SgrEvent::AltScreen(alt));
+                            }
                         }
                         self.esc = EscState::Text;
                         self.params.clear();
@@ -309,6 +385,7 @@ impl SgrConverter {
                         self.params.clear();
                         self.has_intermediate = false;
                     }
+                    i += 1;
                 }
             }
         }
@@ -317,7 +394,31 @@ impl SgrConverter {
         // 不完全な末尾バイト列は self.pending に残して次回 convert() に持ち越す。
         flush_pending_partial(&mut self.pending, &mut buf);
         push_span(&mut spans, &mut buf, self.color);
-        spans
+        flush_spans(&mut events, &mut spans);
+        events
+    }
+}
+
+/// alternate screen CSI を検知する。
+///
+/// params が `?` で始まり、`;` 区切りのパラメータに `1049`/`1047`/`47` のいずれかを含み、
+/// 終端バイトが `h`（true）または `l`（false）の場合に `Some(bool)` を返す。
+fn detect_alt_screen(params: &[u8], terminator: u8) -> Option<bool> {
+    let s = std::str::from_utf8(params).ok()?;
+    let rest = s.strip_prefix('?')?;
+    // `;` 区切りの各パラメータに 1049/1047/47 が含まれるか確認する。
+    let has_alt = rest.split(';').any(|p| matches!(p, "1049" | "1047" | "47"));
+    if has_alt {
+        Some(terminator == b'h')
+    } else {
+        None
+    }
+}
+
+/// spans が空でなければ `SgrEvent::Spans` に変換して events に push する。
+fn flush_spans(events: &mut Vec<SgrEvent>, spans: &mut Vec<OutputSpan>) {
+    if !spans.is_empty() {
+        events.push(SgrEvent::Spans(std::mem::take(spans)));
     }
 }
 
@@ -501,6 +602,15 @@ pub struct SessionTerm {
     mode: Mode,
     /// 出力を実行中ブロックへ取り込んでいる最中か。
     in_command: bool,
+    /// OSC 133 モードで PromptStart（A）を受信してプロンプト表示中か（05: detached output）。
+    /// `true` の間（A〜C）は出力を捨てる（プロンプト本文）。
+    /// `CommandStart`（C）で false、`PromptStart`（A）で true にセットする。
+    at_prompt: bool,
+    /// Auto モードでのエコー除去用: `on_submit` に渡されたコマンド文字列（06）。
+    /// `None` = 判定済み or Osc133 モード。
+    pending_echo: Option<String>,
+    /// エコー除去判定中に `\n` が来るまで溜めるバイトバッファ（06）。
+    echo_buf: Vec<u8>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -522,6 +632,12 @@ pub enum TermAction {
     EndBlock { exit: Option<i32> },
     /// cwd 更新（OSC 7）。
     SetCwd(String),
+    /// \r 単独（プログレスバー上書き）。実行中ブロックの出力の最終行を削除して上書きを開始する。
+    OverwriteLine,
+    /// C〜D 区間外（バックグラウンドジョブ等）の出力。最終ブロックへ Dim で追記する。
+    AppendDetached(Vec<OutputSpan>),
+    /// alternate screen の切替。`true` = 入り（vim 等）、`false` = 出る。
+    AltScreen(bool),
 }
 
 impl Default for SessionTerm {
@@ -537,14 +653,43 @@ impl SessionTerm {
             sgr: SgrConverter::new(),
             mode: Mode::Auto,
             in_command: false,
+            at_prompt: false,
+            pending_echo: None,
+            echo_buf: Vec::new(),
         }
     }
 
     /// 入力行からコマンドが送信された時に呼ぶ。色状態をリセットし、
     /// Auto モードでは即座に出力取り込みを開始する（OSC 133 確定後は C を待つ）。
-    pub fn on_submit(&mut self) {
+    /// `cmd` は Auto モードのエコー除去用に保持する（06: heuristic echo strip）。
+    pub fn on_submit(&mut self, cmd: &str) {
         self.sgr.reset();
         self.in_command = matches!(self.mode, Mode::Auto);
+        // Auto モードのみ: エコー行を比較するためコマンドを保持する。
+        if matches!(self.mode, Mode::Auto) {
+            self.pending_echo = Some(cmd.trim().to_string());
+            self.echo_buf.clear();
+        }
+    }
+
+    /// `SgrEvent` 列を `TermAction` 列に変換して actions へ追記する内部ヘルパ。
+    /// `in_command` 中のみ実際に発行する（プロンプト本文は捨てる）。
+    fn push_sgr_events(&self, events: Vec<SgrEvent>, actions: &mut Vec<TermAction>) {
+        for ev in events {
+            match ev {
+                SgrEvent::Spans(spans) => {
+                    if !spans.is_empty() {
+                        actions.push(TermAction::Append(spans));
+                    }
+                }
+                SgrEvent::CarriageReturn => {
+                    actions.push(TermAction::OverwriteLine);
+                }
+                SgrEvent::AltScreen(b) => {
+                    actions.push(TermAction::AltScreen(b));
+                }
+            }
+        }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TermAction> {
@@ -555,6 +700,10 @@ impl SessionTerm {
                     let was_auto_capturing = self.in_command;
                     self.mode = Mode::Osc133;
                     self.in_command = true;
+                    self.at_prompt = false;
+                    // Auto モード用のエコー除去バッファをクリアする（Osc133 では使わない）。
+                    self.pending_echo = None;
+                    self.echo_buf.clear();
                     self.sgr.reset();
                     // Auto で先取りしていたエコーを捨てる（osc133 確定の初回コマンド対策）。
                     if was_auto_capturing {
@@ -574,6 +723,7 @@ impl SessionTerm {
                         if self.in_command {
                             actions.push(TermAction::EndBlock { exit });
                             self.in_command = false;
+                            self.at_prompt = false;
                         }
                     } else {
                         self.mode = Mode::Osc133;
@@ -587,7 +737,7 @@ impl SessionTerm {
                     // A も「シェルが OSC 133 を出す合図」。Auto モードで来たら
                     // Osc133 確定の合図とし、in_command なら ClearOutput で先取りを捨てる
                     // （ユーザーコマンド未実行のままブロックを閉じない）。
-                    // Osc133 モードでの A 単独受信は無視（直前の D で EndBlock 済み）。
+                    // Osc133 モードでの A 単独受信は at_prompt = true にして D 後の窓を閉じる。
                     if matches!(self.mode, Mode::Auto) {
                         self.mode = Mode::Osc133;
                         if self.in_command {
@@ -595,34 +745,132 @@ impl SessionTerm {
                             self.in_command = false;
                         }
                     }
+                    // OSC 133 モードでは A でプロンプト表示中フラグを立てる（05: detached output）。
+                    self.at_prompt = true;
                 }
                 BlockEvent::Cwd(path) => actions.push(TermAction::SetCwd(path)),
                 BlockEvent::Output(raw) => {
-                    if !self.in_command {
-                        // echo / プロンプト本文なので捨てる。
-                        continue;
-                    }
-                    // Auto（OSC 133 未観測）モードでは行頭 `$`/`%`/`#` をプロンプトとみなし、
-                    // そこでブロックを区切る（exit 不明）。OSC 133 確定後は使わない。
-                    if matches!(self.mode, Mode::Auto) {
-                        if let Some(cut) = prompt_split(&raw) {
-                            let spans = self.sgr.convert(&raw[..cut]);
-                            if !spans.is_empty() {
-                                actions.push(TermAction::Append(spans));
+                    if self.in_command {
+                        // コマンド実行中の出力を取り込む。
+                        // Auto（OSC 133 未観測）モードでは行頭 `$`/`%`/`#` をプロンプトとみなし、
+                        // そこでブロックを区切る（exit 不明）。OSC 133 確定後は使わない。
+                        if matches!(self.mode, Mode::Auto) {
+                            if let Some(cut) = prompt_split(&raw) {
+                                // プロンプト行より前の出力を処理する（echo 除去込み）。
+                                let before = &raw[..cut];
+                                let sgr_evs = self.process_with_echo_strip(before);
+                                self.push_sgr_events(sgr_evs, &mut actions);
+                                actions.push(TermAction::EndBlock { exit: None });
+                                self.in_command = false;
+                                continue;
                             }
-                            actions.push(TermAction::EndBlock { exit: None });
-                            self.in_command = false;
-                            continue;
                         }
-                    }
-                    let spans = self.sgr.convert(&raw);
-                    if !spans.is_empty() {
-                        actions.push(TermAction::Append(spans));
+                        // Auto モードのエコー除去処理（06）。
+                        if matches!(self.mode, Mode::Auto) && self.pending_echo.is_some() {
+                            let sgr_evs = self.process_with_echo_strip(&raw);
+                            self.push_sgr_events(sgr_evs, &mut actions);
+                        } else {
+                            let sgr_evs = self.sgr.convert(&raw);
+                            self.push_sgr_events(sgr_evs, &mut actions);
+                        }
+                    } else {
+                        // コマンド外（プロンプト表示中 or D 後の区間）。
+                        // Osc133 モードで at_prompt == false（D 後〜次 A の前）は
+                        // バックグラウンドジョブ出力として取り込む（05: detached output）。
+                        if matches!(self.mode, Mode::Osc133) && !self.at_prompt {
+                            let sgr_evs = self.sgr.convert(&raw);
+                            let spans: Vec<_> = sgr_evs
+                                .into_iter()
+                                .filter_map(|e| match e {
+                                    SgrEvent::Spans(s) => Some(s),
+                                    _ => None,
+                                })
+                                .flatten()
+                                .collect();
+                            if !spans.is_empty() {
+                                // 空白のみの出力はプロンプト前後のノイズとして捨てる。
+                                let all_text: String =
+                                    spans.iter().map(|s| s.text.as_str()).collect();
+                                if !all_text.trim().is_empty() {
+                                    // Dim 色に上書きして副次出力と区別する。
+                                    let dim_spans: Vec<_> = spans
+                                        .into_iter()
+                                        .map(|mut s| {
+                                            s.color = crate::state::OutputColor::Dim;
+                                            s
+                                        })
+                                        .collect();
+                                    actions.push(TermAction::AppendDetached(dim_spans));
+                                }
+                            }
+                        }
+                        // at_prompt == true（A〜C 間 = プロンプト本文）は従来どおり捨てる。
+                        // Auto モードの非 in_command も捨てる（プロンプトノイズ）。
                     }
                 }
             }
         }
         actions
+    }
+
+    /// Auto モードのエコー除去処理（06: heuristic echo strip）。
+    ///
+    /// `pending_echo` に保持したコマンドと最初の出力行を比較し、一致すればその行を捨てる。
+    /// `\n` を見るまではバイト列を `echo_buf` に溜めて判定を保留する。
+    /// コマンド長 + 16 バイトを超えても `\n` が来なければ諦めてバッファごと流す。
+    fn process_with_echo_strip(&mut self, raw: &[u8]) -> Vec<SgrEvent> {
+        // pending_echo が無い（判定済み or Osc133 モード）場合はそのまま変換。
+        if self.pending_echo.is_none() {
+            return self.sgr.convert(raw);
+        }
+
+        let cmd_len = self.pending_echo.as_ref().map_or(0, |c| c.len());
+        let buf_limit = cmd_len + 16;
+
+        // echo_buf に未処理バイトが残っている状態で新しいバイトを結合して処理する。
+        let combined: Vec<u8> = if self.echo_buf.is_empty() {
+            raw.to_vec()
+        } else {
+            let mut c = std::mem::take(&mut self.echo_buf);
+            c.extend_from_slice(raw);
+            c
+        };
+
+        // `\n` の位置を探す。
+        if let Some(nl_pos) = combined.iter().position(|&b| b == b'\n') {
+            // 最初の行が確定した。echo と比較する。
+            let first_line_raw = &combined[..nl_pos];
+            // `\r` を除去して比較する（PTY は \r\n で終端することが多い）。
+            let first_line = String::from_utf8_lossy(first_line_raw);
+            let first_line_trimmed = first_line.trim_matches('\r').trim();
+
+            let discard = self.pending_echo.as_deref() == Some(first_line_trimmed);
+
+            self.pending_echo = None;
+            self.echo_buf.clear();
+
+            if discard {
+                // エコー行を捨てて残りを変換する。
+                let rest = &combined[nl_pos + 1..];
+                if rest.is_empty() {
+                    Vec::new()
+                } else {
+                    self.sgr.convert(rest)
+                }
+            } else {
+                // エコーと不一致 → そのまま変換する。
+                self.sgr.convert(&combined)
+            }
+        } else if combined.len() > buf_limit {
+            // \n が来ないまま上限超過 → 諦めてバッファごと流す。
+            self.pending_echo = None;
+            self.echo_buf.clear();
+            self.sgr.convert(&combined)
+        } else {
+            // まだ \n が来ていない → 持ち越す。
+            self.echo_buf = combined;
+            Vec::new()
+        }
     }
 }
 
@@ -712,18 +960,40 @@ mod tests {
     #[test]
     fn sgr_converts_colors() {
         let mut c = SgrConverter::new();
-        let spans = c.convert(b"\x1b[32mok\x1b[0m done");
+        let events = c.convert(b"\x1b[32mok\x1b[0m done");
+        let spans: Vec<_> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(s) => Some(s),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         assert_eq!(spans[0].color, OutputColor::Sage);
         assert_eq!(spans[0].text, "ok");
         assert_eq!(spans[1].color, OutputColor::Default);
         assert_eq!(spans[1].text, " done");
     }
 
+    /// CRLF は \n だけに畳まれ、CarriageReturn イベントは発行されない。
     #[test]
     fn sgr_drops_carriage_return() {
         let mut c = SgrConverter::new();
-        let spans = c.convert(b"line\r\nnext");
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let events = c.convert(b"line\r\nnext");
+        // CarriageReturn が出ないこと。
+        assert!(
+            !events.iter().any(|e| matches!(e, SgrEvent::CarriageReturn)),
+            "CRLF は CarriageReturn を出さない: {events:?}",
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
         assert_eq!(text, "line\nnext");
     }
 
@@ -731,7 +1001,15 @@ mod tests {
     fn sgr_color_persists_across_calls() {
         let mut c = SgrConverter::new();
         let _ = c.convert(b"\x1b[31m");
-        let spans = c.convert(b"still red");
+        let events = c.convert(b"still red");
+        let spans: Vec<_> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(s) => Some(s),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         assert_eq!(spans[0].color, OutputColor::Rust);
     }
 
@@ -739,8 +1017,16 @@ mod tests {
     fn sgr_skips_non_sgr_csi() {
         let mut c = SgrConverter::new();
         // カーソル移動 CSI(H) は読み飛ばし、テキストだけ残る。
-        let spans = c.convert(b"a\x1b[2Jb");
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let events = c.convert(b"a\x1b[2Jb");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
         assert_eq!(text, "ab");
     }
 
@@ -760,7 +1046,7 @@ mod tests {
     #[test]
     fn session_term_osc133_flow_drops_echo_and_captures_output() {
         let mut t = SessionTerm::new();
-        t.on_submit();
+        t.on_submit("");
         // echo "ls" → C → "file\n" → D;0
         let actions = t.feed(b"ls\r\n\x1b]133;C\x07file\n\x1b]133;D;0\x07");
         // C の手前で Auto 取り込みしたエコーは ClearOutput で捨てられる。
@@ -783,7 +1069,7 @@ mod tests {
     #[test]
     fn session_term_heuristic_ends_on_prompt_line() {
         let mut t = SessionTerm::new();
-        t.on_submit(); // Auto モード（OSC 133 未観測）
+        t.on_submit(""); // Auto モード（OSC 133 未観測）
         let actions = t.feed(b"output line\n$ ");
         assert!(actions
             .iter()
@@ -802,7 +1088,7 @@ mod tests {
     #[test]
     fn session_term_initial_precmd_d_does_not_close_user_block() {
         let mut t = SessionTerm::new();
-        t.on_submit(); // Auto モード, in_command=true
+        t.on_submit(""); // Auto モード, in_command=true
 
         // シェル初回 precmd: D;0 → A → OSC 7、続いて echo "ls", C, "out\n", D;0
         let raw = b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]7;file://h/tmp\x07ls\r\n\x1b]133;C\x07out\n\x1b]133;D;0\x07";
@@ -840,7 +1126,7 @@ mod tests {
     #[test]
     fn session_term_initial_prompt_a_does_not_close_user_block() {
         let mut t = SessionTerm::new();
-        t.on_submit();
+        t.on_submit("");
         let actions = t.feed(b"\x1b]133;A\x07");
         assert!(
             !actions
@@ -852,6 +1138,31 @@ mod tests {
     }
 
     // ── 01: UTF-8 チャンク境界文字化け修正テスト ──────────────────────────────
+
+    /// `SgrEvent` 列からテキストを結合するヘルパ（テスト用）。
+    fn events_text(events: &[SgrEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `SgrEvent` 列から spans を平坦化するヘルパ（テスト用）。
+    fn events_spans(events: Vec<SgrEvent>) -> Vec<OutputSpan> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(s) => Some(s),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
 
     /// 「こんにちは」を 1 バイト目直後で 2 チャンクに分断しても文字化けしない。
     #[test]
@@ -865,7 +1176,12 @@ mod tests {
         let text: String = s1
             .iter()
             .chain(s2.iter())
-            .map(|s| s.text.as_str())
+            .filter_map(|e| match e {
+                SgrEvent::Spans(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
             .collect();
         assert!(
             !text.contains('\u{FFFD}'),
@@ -886,7 +1202,12 @@ mod tests {
         let text: String = s1
             .iter()
             .chain(s2.iter())
-            .map(|s| s.text.as_str())
+            .filter_map(|e| match e {
+                SgrEvent::Spans(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
             .collect();
         assert!(
             !text.contains('\u{FFFD}'),
@@ -899,10 +1220,10 @@ mod tests {
     #[test]
     fn sgr_invalid_byte_becomes_replacement_char() {
         let mut c = SgrConverter::new();
-        let spans = c.convert(b"\xff");
+        let events = c.convert(b"\xff");
         // convert() の末尾では partial flush するが、0xff は error_len=Some(1) なので
         // 即座に FFFD に変換される。
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text = events_text(&events);
         assert_eq!(text, "\u{FFFD}");
     }
 
@@ -917,8 +1238,8 @@ mod tests {
         // reset 後に残りバイトを渡しても前の未確定バイトとは連結されず独立して処理される。
         // "こ" の 2〜3 バイト目（0x81 0x93）は 1 バイト目なしでは不正 → FFFD になる。
         // 各バイトが個別に不正となるため FFFD が 1 個以上出る。
-        let spans = c.convert(&"こ".as_bytes()[1..]);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let events = c.convert(&"こ".as_bytes()[1..]);
+        let text = events_text(&events);
         assert!(
             text.chars().all(|ch| ch == '\u{FFFD}') && !text.is_empty(),
             "reset 後は前の pending が持ち越されず不正バイト扱いになる: {text:?}",
@@ -931,8 +1252,8 @@ mod tests {
     #[test]
     fn sgr_csi_intermediate_byte_not_output() {
         let mut c = SgrConverter::new();
-        let spans = c.convert(b"a\x1b[0 qb");
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let events = c.convert(b"a\x1b[0 qb");
+        let text = events_text(&events);
         assert_eq!(text, "ab", "q が出力に混入してはいけない: {text:?}");
     }
 
@@ -943,7 +1264,8 @@ mod tests {
         // 最初に赤にする。
         let _ = c.convert(b"\x1b[31m");
         // 中間バイト付き `ESC [ 1 SP m` を送る（SGR 扱いされれば bold 色になるが、無視されるはず）。
-        let spans = c.convert(b"\x1b[1 m x");
+        let events = c.convert(b"\x1b[1 m x");
+        let spans = events_spans(events);
         // 色はリセットされず Rust のまま。
         let text: String = spans.iter().map(|s| s.text.as_str()).collect();
         assert!(text.contains('x'), "テキスト 'x' が含まれる: {text:?}");
@@ -953,6 +1275,333 @@ mod tests {
             last_color,
             Some(OutputColor::Rust),
             "中間バイト付き m は SGR 扱いしない: {spans:?}",
+        );
+    }
+
+    // ── 04: \r 上書き（CarriageReturn）テスト ─────────────────────────────────
+
+    /// `convert(b"ab\rcd")` → Spans("ab"), CarriageReturn, Spans("cd") の順。
+    #[test]
+    fn sgr_cr_emits_carriage_return_event() {
+        let mut c = SgrConverter::new();
+        let events = c.convert(b"ab\rcd");
+        // 先頭が Spans("ab")、次が CarriageReturn、最後が Spans("cd")。
+        assert!(
+            matches!(&events[0], SgrEvent::Spans(s) if s[0].text == "ab"),
+            "先頭 Spans(ab): {events:?}",
+        );
+        assert!(
+            matches!(&events[1], SgrEvent::CarriageReturn),
+            "CarriageReturn: {events:?}",
+        );
+        assert!(
+            matches!(&events[2], SgrEvent::Spans(s) if s[0].text == "cd"),
+            "末尾 Spans(cd): {events:?}",
+        );
+    }
+
+    /// `convert(b"ab\r\ncd")` → CRLF は改行に畳まれ CarriageReturn が出ないこと。
+    #[test]
+    fn sgr_crlf_no_carriage_return() {
+        let mut c = SgrConverter::new();
+        let events = c.convert(b"ab\r\ncd");
+        assert!(
+            !events.iter().any(|e| matches!(e, SgrEvent::CarriageReturn)),
+            "CRLF では CarriageReturn を出さない: {events:?}",
+        );
+        let text = events_text(&events);
+        assert_eq!(text, "ab\ncd");
+    }
+
+    /// チャンク末尾 `\r` → 次が `\n`（CRLF）の場合、CarriageReturn が出ない。
+    #[test]
+    fn sgr_cr_pending_then_lf_is_crlf() {
+        let mut c = SgrConverter::new();
+        let e1 = c.convert(b"ab\r");
+        let e2 = c.convert(b"\ncd");
+        // e1 は Spans("ab") だけ（\r は次チャンクへ持ち越し）。
+        assert!(
+            !e1.iter().any(|e| matches!(e, SgrEvent::CarriageReturn)),
+            "持ち越し CR で CarriageReturn を出さない: {e1:?}",
+        );
+        // e2 では CRLF → LF として取り込み、CarriageReturn なし。
+        assert!(
+            !e2.iter().any(|e| matches!(e, SgrEvent::CarriageReturn)),
+            "次チャンク先頭が LF → CRLF 扱い: {e2:?}",
+        );
+        let text: String = e1
+            .iter()
+            .chain(e2.iter())
+            .filter_map(|e| match e {
+                SgrEvent::Spans(s) => Some(s.iter().map(|sp| sp.text.as_str()).collect::<String>()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ab\ncd");
+    }
+
+    /// チャンク末尾 `\r` → 次が `\n` でない場合、CarriageReturn が先に発行される。
+    #[test]
+    fn sgr_cr_pending_then_non_lf_emits_cr() {
+        let mut c = SgrConverter::new();
+        let e1 = c.convert(b"ab\r");
+        let e2 = c.convert(b"cd");
+        // e1 は Spans("ab") のみ。
+        assert_eq!(events_text(&e1), "ab");
+        // e2 では CarriageReturn が先に出てから Spans("cd")。
+        assert!(
+            e2.iter().any(|e| matches!(e, SgrEvent::CarriageReturn)),
+            "次チャンクが非 LF → CarriageReturn: {e2:?}",
+        );
+        assert_eq!(events_text(&e2), "cd");
+    }
+
+    /// `SessionTerm` に `"50%\r100%"` を流すと最終 Append テキストが `"100%"` になる e2e テスト。
+    #[test]
+    fn session_term_progress_bar_overwrite() {
+        use crate::state::{AppState, OutputSpan};
+        let mut t = SessionTerm::new();
+        t.on_submit("test");
+        // C → "50%\r100%" → D;0
+        let actions = t.feed(b"\x1b]133;C\x07 50%\r100%\x1b]133;D;0\x07");
+        // OverwriteLine が発行されている。
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TermAction::OverwriteLine)),
+            "OverwriteLine が発行される: {actions:?}",
+        );
+        // Append("100%") が含まれている。
+        let appended: String = actions
+            .iter()
+            .filter_map(|a| match a {
+                TermAction::Append(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            appended.contains("100%"),
+            "100% が Append される: {appended:?}"
+        );
+
+        // AppState に適用して最終テキストを確認する。
+        let mut state = AppState::seed();
+        state.focus_session("s3");
+        if let Some(sess) = state.active_mut() {
+            sess.input_buffer = "test".into();
+        }
+        state.submit_input("12:00".into());
+        for action in actions {
+            state.apply_term_action("s3", action);
+        }
+        let block = state.active().unwrap().blocks.last().unwrap();
+        let text: String = block.output.iter().map(|s| s.text.as_str()).collect();
+        // OverwriteLine で先頭行が削れ、100% が残る。
+        assert!(
+            text.contains("100%"),
+            "最終出力に 100% が含まれる: {text:?}",
+        );
+        assert!(!text.contains("50%"), "50% は上書きされて消える: {text:?}",);
+        // OutputSpan 型の使用を明示するため型注釈（未使用変数抑制）。
+        let _: &[OutputSpan] = &block.output;
+    }
+
+    // ── 05: DetachedOutput テスト ──────────────────────────────────────────────
+
+    /// OSC 133 モードで D → ジョブ通知 → A の順で AppendDetached が発行される。
+    #[test]
+    fn session_term_detached_output_emitted_after_end() {
+        let mut t = SessionTerm::new();
+        // まず Osc133 モードに切り替える（D → A）。
+        t.on_submit("");
+        let _ = t.feed(b"\x1b]133;C\x07out\n\x1b]133;D;0\x07"); // D で Osc133 確定 + in_command=false
+                                                                // D の後（at_prompt=false）にジョブ通知。
+        let actions = t.feed(b"[1]  + done sleep 5\n");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TermAction::AppendDetached(_))),
+            "D 後の出力は AppendDetached: {actions:?}",
+        );
+    }
+
+    /// OSC 133 モードで A → プロンプト文字列 → C の間は AppendDetached が出ない。
+    #[test]
+    fn session_term_detached_output_not_emitted_in_prompt() {
+        let mut t = SessionTerm::new();
+        // Osc133 確定。
+        t.on_submit("");
+        let _ = t.feed(b"\x1b]133;C\x07out\n\x1b]133;D;0\x07");
+        // A（at_prompt=true）→ プロンプト文字列 → C。
+        let actions = t.feed(b"\x1b]133;A\x07user@host:~$ \x1b]133;C\x07");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, TermAction::AppendDetached(_))),
+            "A〜C 間は AppendDetached を出さない: {actions:?}",
+        );
+    }
+
+    /// 空白のみの区間外出力は AppendDetached が発行されない。
+    #[test]
+    fn session_term_detached_whitespace_only_not_emitted() {
+        let mut t = SessionTerm::new();
+        t.on_submit("");
+        let _ = t.feed(b"\x1b]133;C\x07out\n\x1b]133;D;0\x07");
+        let actions = t.feed(b"   \n  \n");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, TermAction::AppendDetached(_))),
+            "空白のみは AppendDetached を出さない: {actions:?}",
+        );
+    }
+
+    // ── 06: Auto モードエコー除去テスト ───────────────────────────────────────
+
+    /// Auto モードで `on_submit("ls")` → `"ls\r\nfile1\n"` → エコー行だけ捨てられる。
+    #[test]
+    fn session_term_auto_echo_stripped() {
+        let mut t = SessionTerm::new();
+        t.on_submit("ls");
+        let actions = t.feed(b"ls\r\nfile1\n");
+        let text: String = actions
+            .iter()
+            .filter_map(|a| match a {
+                TermAction::Append(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "file1\n", "エコー行 'ls' が捨てられる: text={text:?}");
+    }
+
+    /// Auto モードで先頭行が echo と不一致の場合は何も捨てられない。
+    #[test]
+    fn session_term_auto_echo_mismatch_kept() {
+        let mut t = SessionTerm::new();
+        t.on_submit("ls");
+        let actions = t.feed(b"file1\nfile2\n");
+        let text: String = actions
+            .iter()
+            .filter_map(|a| match a {
+                TermAction::Append(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("file1") && text.contains("file2"),
+            "不一致時は何も捨てない: {text:?}",
+        );
+    }
+
+    /// チャンク分断でも正しくエコー行だけ捨てられる。
+    #[test]
+    fn session_term_auto_echo_chunked() {
+        let mut t = SessionTerm::new();
+        t.on_submit("ls");
+        let _ = t.feed(b"ls");
+        let actions = t.feed(b"\r\nfile1\n");
+        let text: String = actions
+            .iter()
+            .filter_map(|a| match a {
+                TermAction::Append(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "file1\n",
+            "チャンク分断でもエコー行が捨てられる: {text:?}"
+        );
+    }
+
+    // ── 07: alternate screen テスト ────────────────────────────────────────────
+
+    /// `\x1b[?1049h` → AltScreen(true)。
+    #[test]
+    fn sgr_alt_screen_enter_1049() {
+        let mut c = SgrConverter::new();
+        let events = c.convert(b"\x1b[?1049h");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SgrEvent::AltScreen(true))),
+            "AltScreen(true) が発行される: {events:?}",
+        );
+    }
+
+    /// `\x1b[?1049l` → AltScreen(false)。
+    #[test]
+    fn sgr_alt_screen_leave_1049() {
+        let mut c = SgrConverter::new();
+        let events = c.convert(b"\x1b[?1049l");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SgrEvent::AltScreen(false))),
+            "AltScreen(false) が発行される: {events:?}",
+        );
+    }
+
+    /// `\x1b[?47h` と `\x1b[?1047h` も AltScreen(true)。
+    #[test]
+    fn sgr_alt_screen_47_and_1047() {
+        let mut c = SgrConverter::new();
+        let e1 = c.convert(b"\x1b[?47h");
+        assert!(
+            e1.iter().any(|e| matches!(e, SgrEvent::AltScreen(true))),
+            "?47h は AltScreen(true): {e1:?}",
+        );
+        let e2 = c.convert(b"\x1b[?1047h");
+        assert!(
+            e2.iter().any(|e| matches!(e, SgrEvent::AltScreen(true))),
+            "?1047h は AltScreen(true): {e2:?}",
+        );
+    }
+
+    /// `\x1b[?25h`（カーソル表示）では AltScreen が発行されない。
+    #[test]
+    fn sgr_alt_screen_cursor_show_not_triggered() {
+        let mut c = SgrConverter::new();
+        let events = c.convert(b"\x1b[?25h");
+        assert!(
+            !events.iter().any(|e| matches!(e, SgrEvent::AltScreen(_))),
+            "?25h では AltScreen を出さない: {events:?}",
+        );
+    }
+
+    /// SessionTerm: `\x1b[?1049h` → TermAction::AltScreen(true)。
+    #[test]
+    fn session_term_alt_screen_action() {
+        let mut t = SessionTerm::new();
+        t.on_submit("vim");
+        let actions = t.feed(b"\x1b]133;C\x07\x1b[?1049h");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TermAction::AltScreen(true))),
+            "AltScreen(true) action: {actions:?}",
+        );
+    }
+
+    /// SessionTerm: `\x1b[?1049l` → TermAction::AltScreen(false)。
+    #[test]
+    fn session_term_alt_screen_leave_action() {
+        let mut t = SessionTerm::new();
+        t.on_submit("vim");
+        let actions = t.feed(b"\x1b]133;C\x07\x1b[?1049h\x1b[?1049l");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TermAction::AltScreen(false))),
+            "AltScreen(false) action: {actions:?}",
         );
     }
 }
