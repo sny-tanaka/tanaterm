@@ -207,7 +207,12 @@ impl TanaTermApp {
         }
         if do_close {
             if let Some(id) = self.state.ui.active_session_id.clone() {
-                self.state.close_session(&id);
+                // close_session が false の時は最後の 1 セッションなので toast を出す（10）。
+                if !self.state.close_session(&id) {
+                    let now = ctx.input(|i| i.time);
+                    self.state
+                        .show_toast("最後のセッションは閉じられません", None, now);
+                }
             }
         }
         if do_focus_search {

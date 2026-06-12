@@ -189,7 +189,11 @@ fn session_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, active: bool, 
             .interact_pointer_pos()
             .is_some_and(|p| close_rect.contains(p));
         if on_close {
-            state.close_session(id);
+            // close_session が false の時は最後の 1 セッションなので toast を出す（10）。
+            if !state.close_session(id) {
+                let now = ui.input(|i| i.time);
+                state.show_toast("最後のセッションは閉じられません", None, now);
+            }
         } else {
             state.focus_session(id);
         }

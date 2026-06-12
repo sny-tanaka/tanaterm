@@ -588,12 +588,15 @@ impl AppState {
     }
 
     /// 指定セッションを閉じる。最後の 1 つは閉じない（仕様メモ "空セッションで起動" に揃える）。
-    pub fn close_session(&mut self, id: &str) {
+    ///
+    /// 実際に閉じた場合は `true`、最後の 1 セッションのため閉じなかった場合は `false` を返す。
+    /// 呼び出し元は `false` の時に「最後のセッションは閉じられません」toast を表示する（10）。
+    pub fn close_session(&mut self, id: &str) -> bool {
         if self.sessions.len() <= 1 {
-            return;
+            return false;
         }
         let Some(pos) = self.sessions.iter().position(|s| s.id == id) else {
-            return;
+            return false;
         };
         self.sessions.remove(pos);
         if self.ui.active_session_id.as_deref() == Some(id) {
@@ -604,6 +607,7 @@ impl AppState {
             self.cancel_rename();
         }
         self.pending.push(PendingPty::Close { id: id.to_string() });
+        true
     }
 
     /// アクティブセッションに生バイト列を `PendingPty::SendRaw` として積む。
@@ -1450,13 +1454,18 @@ mod tests {
     fn close_session_refuses_to_remove_last_one() {
         let mut s = fresh();
         let ids: Vec<String> = s.sessions.iter().map(|x| x.id.clone()).collect();
-        // 最後の 1 つになるまで閉じる
+        // 最後の 1 つになるまで閉じる（それ以外は true を返す）。
         for id in &ids[..ids.len() - 1] {
-            s.close_session(id);
+            assert!(
+                s.close_session(id),
+                "最後以外の close_session は true を返す"
+            );
         }
         assert_eq!(s.sessions.len(), 1, "下準備として 1 セッションになるはず");
         let last_id = s.sessions[0].id.clone();
-        s.close_session(&last_id);
+        // 最後の 1 セッションは閉じない → false を返す（10: 戻り値の assert）。
+        let result = s.close_session(&last_id);
+        assert!(!result, "最後の 1 つを閉じようとすると false が返る");
         assert_eq!(s.sessions.len(), 1, "最後の 1 つは閉じられない");
         assert_eq!(s.ui.active_session_id.as_deref(), Some(last_id.as_str()));
     }
@@ -1466,7 +1475,8 @@ mod tests {
         let mut s = fresh();
         // active を s2 にして s2 を閉じると、削除位置にある旧 s3 がアクティブになる。
         s.focus_session("s2");
-        s.close_session("s2");
+        let result = s.close_session("s2");
+        assert!(result, "s2 を閉じると true を返す");
         assert_eq!(s.ui.active_session_id.as_deref(), Some("s3"));
     }
 
