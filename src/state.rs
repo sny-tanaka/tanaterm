@@ -112,6 +112,11 @@ pub struct Session {
     /// `EndBlock` 時に false に戻す（leave シーケンス取りこぼし保険）。
     #[serde(skip)]
     pub alt_screen: bool,
+    /// シェルが終了（`exit` / Ctrl+D / spawn 失敗）したか（08: シェル終了検知）。
+    /// `true` の間は入力を受け付けず、restart 導線を表示する。
+    /// `restart_session` で false に戻す。
+    #[serde(skip)]
+    pub shell_exited: bool,
 }
 
 /// Shelf に登録された "お気に入りディレクトリ"。
@@ -390,6 +395,7 @@ impl AppState {
             history: Vec::new(),
             history_cursor: None,
             alt_screen: false,
+            shell_exited: false,
         };
         Self {
             sessions: vec![session],
@@ -452,6 +458,7 @@ impl AppState {
                 history: Vec::new(),
                 history_cursor: None,
                 alt_screen: false,
+                shell_exited: false,
             })
             .collect();
 
@@ -569,6 +576,7 @@ impl AppState {
             history: Vec::new(),
             history_cursor: None,
             alt_screen: false,
+            shell_exited: false,
         };
         self.sessions.push(session);
         self.ui.active_session_id = Some(id.clone());
@@ -602,7 +610,7 @@ impl AppState {
     ///
     /// Ctrl+C(0x03) などの制御文字を実行中シェルへ転送する用途。`Send` と違い
     /// `on_submit()`（SGR リセット・出力取り込み開始）は発火しない。
-    /// アクティブセッションがない / `bytes` が空の場合は何もしない。
+    /// アクティブセッションがない / `bytes` が空 / `shell_exited` な場合は何もしない。
     pub fn push_pty_send_raw(&mut self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
@@ -610,6 +618,10 @@ impl AppState {
         let Some(id) = self.ui.active_session_id.clone() else {
             return;
         };
+        // シェル終了済みセッションへの送信は無視する（08: 幽霊 running ブロック防止）。
+        if self.sessions.iter().any(|s| s.id == id && s.shell_exited) {
+            return;
+        }
         self.pending.push(PendingPty::SendRaw { id, bytes });
     }
 
@@ -622,7 +634,12 @@ impl AppState {
     /// 呼び出し元は busy（直近ブロックが `running`）を確認した上で呼ぶ前提。
     /// idle 中に呼ぶと裸の `\n` が PTY に流れて UI と PTY 状態がずれるため、
     /// 公開範囲を crate 内に絞っている。
+    /// シェル終了済みセッションには no-op（08: 幽霊 running ブロック防止）。
     pub(crate) fn submit_input_as_stdin(&mut self) {
+        // shell_exited なら何もしない（08）。
+        if self.active().is_some_and(|s| s.shell_exited) {
+            return;
+        }
         let Some(session) = self.active_mut() else {
             return;
         };
@@ -637,7 +654,12 @@ impl AppState {
     /// 空入力は無視。実行中ブロック（`running` = true, exit 未確定）を作って末尾に積み、
     /// セッションを Busy にし、`"<cmd>\n"` の送信を `pending` に積む。実出力・exit code は
     /// PTY 応答を [`Self::apply_term_action`] が後から流し込む。
+    /// シェル終了済みセッションには no-op（08: 幽霊 running ブロック防止）。
     pub fn submit_input(&mut self, now_hhmm: String) {
+        // shell_exited なら何もしない（08）。
+        if self.active().is_some_and(|s| s.shell_exited) {
+            return;
+        }
         let block_id = self.fresh_id("b");
         let Some(session) = self.active_mut() else {
             return;
@@ -816,14 +838,40 @@ impl AppState {
             .is_some_and(|s| s.alt_screen)
     }
 
-    /// シェルが終了（チャンネル切断）したセッションを Idle にし、実行中ブロックを閉じる。
+    /// シェルが終了（チャンネル切断 / spawn 失敗）したセッションを Idle にし、実行中ブロックを閉じる。
+    ///
+    /// `shell_exited = true` にすることで、入力行の TextEdit を無効化して
+    /// restart 導線に切り替える（08: シェル終了検知）。
     pub fn mark_session_exited(&mut self, id: &str) {
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
             s.status = SessionStatus::Idle;
+            s.shell_exited = true;
             for b in s.blocks.iter_mut() {
                 b.running = false;
             }
         }
+    }
+
+    /// 終了したシェルを再起動する（08: restart 導線）。
+    ///
+    /// `shell_exited` を false に戻し、status を Live にして
+    /// `PendingPty::Spawn` を積む。PTY ハンドルは exited 時に close 済みなので
+    /// `PtyManager::spawn` が新規起動する。
+    pub fn restart_session(&mut self, id: &str) {
+        let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        s.shell_exited = false;
+        s.status = SessionStatus::Live;
+        let cwd = s
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.pwd.clone());
+        self.pending.push(PendingPty::Spawn {
+            id: id.to_string(),
+            cwd,
+        });
     }
 
     /// OSC 7 で得た実 cwd をセッションに反映する。表示 pwd は `$HOME` を `~` に畳む。
@@ -1241,6 +1289,7 @@ mod seed {
                 history: vec!["ls -la".into(), "pnpm typecheck".into(), "pnpm dev".into()],
                 history_cursor: None,
                 alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s2".into(),
@@ -1265,6 +1314,7 @@ mod seed {
                 history: vec!["docker compose logs -f api".into()],
                 history_cursor: None,
                 alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s3".into(),
@@ -1280,6 +1330,7 @@ mod seed {
                 history: Vec::new(),
                 history_cursor: None,
                 alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s4".into(),
@@ -1295,6 +1346,7 @@ mod seed {
                 history: Vec::new(),
                 history_cursor: None,
                 alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s5".into(),
@@ -1310,6 +1362,7 @@ mod seed {
                 history: Vec::new(),
                 history_cursor: None,
                 alt_screen: false,
+                shell_exited: false,
             },
         ]
     }
@@ -2051,6 +2104,80 @@ mod tests {
             s.active().unwrap().blocks.len(),
             block_count,
             "ブロック 0 件では何も起きない",
+        );
+    }
+
+    // ── 08: shell_exited / restart_session テスト ─────────────────────────────
+
+    /// `mark_session_exited` 後の `submit_input` は no-op（幽霊 running ブロック防止）。
+    #[test]
+    fn submit_input_is_noop_after_shell_exited() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        let blocks_before = s.active().unwrap().blocks.len();
+        s.pending.clear();
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "ls".into();
+        }
+        s.submit_input("12:00".into());
+        assert_eq!(
+            s.active().unwrap().blocks.len(),
+            blocks_before,
+            "shell_exited 中は新規ブロックを積まない"
+        );
+        assert!(s.pending.is_empty(), "shell_exited 中は pending も積まない");
+    }
+
+    /// `mark_session_exited` 後の `submit_input_as_stdin` は no-op。
+    #[test]
+    fn submit_input_as_stdin_is_noop_after_shell_exited() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        s.pending.clear();
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "y".into();
+        }
+        s.submit_input_as_stdin();
+        assert!(s.pending.is_empty(), "shell_exited 中は SendRaw も積まない");
+    }
+
+    /// `mark_session_exited` 後の `push_pty_send_raw` は no-op。
+    #[test]
+    fn push_pty_send_raw_is_noop_after_shell_exited() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        s.pending.clear();
+        s.push_pty_send_raw(vec![0x03]);
+        assert!(s.pending.is_empty(), "shell_exited 中は SendRaw も積まない");
+    }
+
+    /// `restart_session` で `shell_exited` が false に戻り、`PendingPty::Spawn` が積まれ、
+    /// status が Live になること。
+    #[test]
+    fn restart_session_resets_state_and_queues_spawn() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        assert!(s.active().unwrap().shell_exited, "終了済み状態になっている");
+        assert_eq!(s.active().unwrap().status, SessionStatus::Idle);
+        s.pending.clear();
+        s.restart_session("s3");
+        assert!(
+            !s.active().unwrap().shell_exited,
+            "restart で shell_exited が false に戻る"
+        );
+        assert_eq!(
+            s.active().unwrap().status,
+            SessionStatus::Live,
+            "restart で status が Live になる"
+        );
+        assert_eq!(s.pending.len(), 1, "Spawn が 1 件積まれる");
+        assert!(
+            matches!(s.pending[0], PendingPty::Spawn { ref id, .. } if id == "s3"),
+            "積まれる PendingPty は Spawn"
         );
     }
 

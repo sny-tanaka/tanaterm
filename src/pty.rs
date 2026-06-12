@@ -45,10 +45,14 @@ impl PtyManager {
         Self::default()
     }
 
-    /// 指定セッションのシェルを起動する。既存 ID は no-op。
-    pub fn spawn(&mut self, id: &str, spec: SpawnSpec, ctx: &egui::Context) {
+    /// 指定セッションのシェルを起動する。既存 ID は no-op（既存なら true を返す）。
+    ///
+    /// 起動に成功した場合 `true`、失敗した場合 `false` を返す。
+    /// 呼び出し元（`app.rs::apply_pending`）は `false` の場合に
+    /// `state.mark_session_exited` ＋ toast を表示する（08: spawn 失敗検知）。
+    pub fn spawn(&mut self, id: &str, spec: SpawnSpec, ctx: &egui::Context) -> bool {
         if self.handles.contains_key(id) {
-            return;
+            return true;
         }
         match PtySession::spawn(spec, ctx.clone()) {
             Ok(pty) => {
@@ -59,8 +63,12 @@ impl PtyManager {
                         term: SessionTerm::new(),
                     },
                 );
+                true
             }
-            Err(err) => eprintln!("tanaterm: failed to spawn pty for {id}: {err}"),
+            Err(err) => {
+                eprintln!("tanaterm: failed to spawn pty for {id}: {err}");
+                false
+            }
         }
     }
 

@@ -124,7 +124,7 @@ impl TanaTermApp {
                     // ここで都度計算する。pending に Spawn + Send が並んだ時、Send 側で
                     // 直近ブロックが running 化される前後で行高が変わる可能性に備える。
                     let (rows, cols) = term_grid_size(ctx, main_rect, &self.state);
-                    self.pty.spawn(
+                    let ok = self.pty.spawn(
                         &id,
                         SpawnSpec {
                             shell,
@@ -135,6 +135,13 @@ impl TanaTermApp {
                         },
                         ctx,
                     );
+                    // spawn 失敗時はセッションを exited 状態にして toast を出す（08）。
+                    if !ok {
+                        self.state.mark_session_exited(&id);
+                        let now = ctx.input(|i| i.time);
+                        self.state
+                            .show_toast("シェルの起動に失敗しました", None, now);
+                    }
                 }
                 PendingPty::Send { id, bytes } => {
                     // bytes から末尾の \n を除いた UTF-8 文字列をコマンドとして渡す（06）。

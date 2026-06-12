@@ -507,9 +507,9 @@ fn input_row(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn input_meta(ui: &mut egui::Ui, state: &mut AppState) {
-    let Some((pwd, hist_len, busy_cmd)) = state.active().map(|s| {
+    let Some((pwd, hist_len, busy_cmd, shell_exited)) = state.active().map(|s| {
         let busy = s.blocks.last().filter(|b| b.running).map(|b| b.cmd.clone());
-        (s.pwd.clone(), s.history.len(), busy)
+        (s.pwd.clone(), s.history.len(), busy, s.shell_exited)
     }) else {
         return;
     };
@@ -529,29 +529,40 @@ fn input_meta(ui: &mut egui::Ui, state: &mut AppState) {
         }
         pill(ui, "tana", true, false);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // shell_exited 時は「shell exited」を表示（08: シェル終了検知）。
             // 実行中: 入力が「新コマンド」ではなく「running プロセスの stdin」に流れる
             // ことを明示し、止め方（^C）も同時に提示する。
             // 通常: history 件数と tab 補完のヒント。
-            match busy_cmd {
-                Some(cmd) => {
-                    ui.label(
-                        egui::RichText::new("^C で中断")
-                            .color(theme::RUST)
-                            .size(11.0),
-                    );
-                    ui.label(egui::RichText::new("·").color(theme::FG_3).size(11.0));
-                    ui.label(
-                        egui::RichText::new(format!("stdin → {}", truncate_for_hint(&cmd, 32)))
-                            .color(theme::AMBER)
-                            .size(11.0),
-                    );
-                }
-                None => {
-                    ui.label(
-                        egui::RichText::new(format!("history: {hist_len} · tab to autocomplete"))
+            if shell_exited {
+                ui.label(
+                    egui::RichText::new("shell exited")
+                        .color(theme::FG_2)
+                        .size(11.0),
+                );
+            } else {
+                match busy_cmd {
+                    Some(cmd) => {
+                        ui.label(
+                            egui::RichText::new("^C で中断")
+                                .color(theme::RUST)
+                                .size(11.0),
+                        );
+                        ui.label(egui::RichText::new("·").color(theme::FG_3).size(11.0));
+                        ui.label(
+                            egui::RichText::new(format!("stdin → {}", truncate_for_hint(&cmd, 32)))
+                                .color(theme::AMBER)
+                                .size(11.0),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "history: {hist_len} · tab to autocomplete"
+                            ))
                             .color(theme::FG_2)
                             .size(11.0),
-                    );
+                        );
+                    }
                 }
             }
         });
@@ -601,10 +612,13 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
     let mut history_up = false;
     let mut history_down = false;
     let mut complete = false;
+    let mut do_restart = false;
 
     // input_buffer を一旦取り出し、TextEdit に渡している間は state を非借用にする。
     // describe→state.* を呼び出せる構造を保つための定石パターン。
     let has_active = state.active().is_some();
+    // shell_exited 時は TextEdit の代わりに restart 導線を表示する（08: シェル終了検知）。
+    let shell_exited = state.active().is_some_and(|s| s.shell_exited);
     // Busy 時は「入力が新コマンドでなく running プロセスの stdin へ届く」ことを hint で示す。
     let busy_cmd: Option<String> = state
         .active()
@@ -632,7 +646,33 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                         .color(theme::AMBER)
                         .size(13.5),
                 );
-                if has_active {
+                if shell_exited {
+                    // シェル終了済み: TextEdit を表示せず restart 導線を表示する（08）。
+                    ui.label(
+                        egui::RichText::new("shell exited")
+                            .color(theme::FG_2)
+                            .size(13.0),
+                    );
+                    ui.add_space(8.0);
+                    // 「restart shell ↵」はクリック可能テキスト（amber）。
+                    let restart_resp = ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new("restart shell ↵")
+                                    .color(theme::AMBER)
+                                    .size(13.0),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if restart_resp.clicked() {
+                        do_restart = true;
+                    }
+                    // Enter キーでも restart を呼べる（フォーカスは無いがグローバルに拾う）。
+                    if ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_restart = true;
+                    }
+                } else if has_active {
                     let hint = match &busy_cmd {
                         Some(cmd) => {
                             format!("type to send stdin to {}…", truncate_for_hint(cmd, 24))
@@ -675,20 +715,22 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // ↵ ボタンは見た目「リターンキー」だが実体は送信ボタン。クリックでも
-                    // Enter 押下と同じ submit が走るようにする（lost_focus + Enter のキー
-                    // ハンドリングと分岐は同じ）。busy 時は「stdin 送信」を意味する。
-                    if widgets::kbd_return_button(ui).clicked() {
-                        submit = true;
+                    if !shell_exited {
+                        // ↵ ボタンは見た目「リターンキー」だが実体は送信ボタン。クリックでも
+                        // Enter 押下と同じ submit が走るようにする（lost_focus + Enter のキー
+                        // ハンドリングと分岐は同じ）。busy 時は「stdin 送信」を意味する。
+                        if widgets::kbd_return_button(ui).clicked() {
+                            submit = true;
+                        }
+                        // busy 時は "send stdin"、idle 時は "press" にして
+                        // input_meta の「stdin → {cmd}」とラベルの意図を揃える。
+                        let leading = if busy_cmd.is_some() {
+                            "send stdin"
+                        } else {
+                            "press"
+                        };
+                        ui.label(egui::RichText::new(leading).color(theme::FG_3).size(11.0));
                     }
-                    // busy 時は "send stdin"、idle 時は "press" にして
-                    // input_meta の「stdin → {cmd}」とラベルの意図を揃える。
-                    let leading = if busy_cmd.is_some() {
-                        "send stdin"
-                    } else {
-                        "press"
-                    };
-                    ui.label(egui::RichText::new(leading).color(theme::FG_3).size(11.0));
                 });
             });
         })
@@ -713,6 +755,13 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
         // 内側 1px の amber 輪郭。
         ui.painter()
             .rect_stroke(frame_resp.rect, 8.0, egui::Stroke::new(1.0, theme::AMBER));
+    }
+
+    // shell_exited 時の restart 処理（08: restart 導線）。
+    if do_restart {
+        if let Some(id) = state.ui.active_session_id.clone() {
+            state.restart_session(&id);
+        }
     }
 
     if submit {
