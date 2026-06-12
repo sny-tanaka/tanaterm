@@ -310,7 +310,7 @@ pub struct PersistentState {
     pub font_size: f32,
 }
 
-/// 永続化するセッションの最小情報（name / pwd / pinned / shell）。blocks は復元しない。
+/// 永続化するセッションの最小情報（name / pwd / pinned / shell / history）。blocks は復元しない。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentSession {
     pub id: String,
@@ -321,6 +321,9 @@ pub struct PersistentSession {
     /// このセッションを起動したシェル。再起動時に同じシェルを使うために保存する。
     #[serde(default)]
     pub shell: crate::config::Shell,
+    /// ↑↓ 履歴（末尾 200 件まで保存）。再起動後も履歴を引き継ぐ（20: 履歴永続化）。
+    #[serde(default)]
+    pub history: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -448,16 +451,26 @@ impl AppState {
 
     /// 現在状態から永続化サブセットを抽出する（`eframe::App::save` 用）。
     pub fn to_persistent(&self) -> PersistentState {
+        const MAX_HISTORY: usize = 200;
         PersistentState {
             sessions: self
                 .sessions
                 .iter()
-                .map(|s| PersistentSession {
-                    id: s.id.clone(),
-                    name: s.name.clone(),
-                    pwd: s.pwd.clone(),
-                    pinned: s.pinned,
-                    shell: s.shell,
+                .map(|s| {
+                    // 末尾 200 件に切り詰めて保存する（20: 履歴永続化）。
+                    let history = if s.history.len() <= MAX_HISTORY {
+                        s.history.clone()
+                    } else {
+                        s.history[s.history.len() - MAX_HISTORY..].to_vec()
+                    };
+                    PersistentSession {
+                        id: s.id.clone(),
+                        name: s.name.clone(),
+                        pwd: s.pwd.clone(),
+                        pinned: s.pinned,
+                        shell: s.shell,
+                        history,
+                    }
                 })
                 .collect(),
             active_session_id: self.ui.active_session_id.clone(),
@@ -498,7 +511,8 @@ impl AppState {
                 shell: ps.shell,
                 cwd: None,
                 input_buffer: String::new(),
-                history: Vec::new(),
+                // 保存済み履歴を復元する（history_cursor は None のまま）（20: 履歴永続化）。
+                history: ps.history.clone(),
                 history_cursor: None,
                 alt_screen: false,
                 shell_exited: false,
@@ -2214,6 +2228,7 @@ mod tests {
                 pwd: "~/".into(),
                 pinned: false,
                 shell: crate::config::Shell::default(),
+                history: Vec::new(),
             }],
             ..Default::default()
         };
@@ -2815,6 +2830,56 @@ mod tests {
         assert!(
             !matches_query("foo bar zzz", &["foo", "bar"]),
             "一語でもミスなら false"
+        );
+    }
+
+    // ── 20: コマンド履歴永続化テスト ─────────────────────────────────────────
+
+    /// to_persistent → from_persistent で history が復元される。
+    #[test]
+    fn persistent_roundtrip_preserves_history() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        // s3 の履歴を手動でセットする。
+        if let Some(sess) = s.active_mut() {
+            sess.history = vec!["ls".into(), "pwd".into(), "echo hello".into()];
+        }
+        let restored = AppState::from_persistent(s.to_persistent());
+        let s3 = restored.sessions.iter().find(|x| x.id == "s3").unwrap();
+        assert_eq!(
+            s3.history,
+            vec!["ls", "pwd", "echo hello"],
+            "to_persistent → from_persistent で history が復元される"
+        );
+        // history_cursor は None に戻る。
+        assert!(
+            s3.history_cursor.is_none(),
+            "復元後の history_cursor は None"
+        );
+    }
+
+    /// 200 件超の history は末尾 200 件に切り詰められる。
+    #[test]
+    fn persistent_history_truncated_to_200() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        // 250 件の履歴を追加する。
+        if let Some(sess) = s.active_mut() {
+            sess.history = (0..250u32).map(|i| format!("cmd{i}")).collect();
+        }
+        let p = s.to_persistent();
+        let ps3 = p.sessions.iter().find(|x| x.id == "s3").unwrap();
+        assert_eq!(ps3.history.len(), 200, "250 件は 200 件に切り詰められる");
+        // 末尾 200 件（cmd50..cmd249）が残る。
+        assert_eq!(
+            ps3.history.first().map(String::as_str),
+            Some("cmd50"),
+            "先頭は cmd50"
+        );
+        assert_eq!(
+            ps3.history.last().map(String::as_str),
+            Some("cmd249"),
+            "末尾は cmd249"
         );
     }
 }
