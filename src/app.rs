@@ -229,7 +229,23 @@ impl TanaTermApp {
     /// 入力行 `TextEdit` は Enter/Tab/↑↓ しか拾わないため、実行中コマンドへ SIGINT 等を
     /// 送る手段が他にない。`consume_key` で先取りすることで、Ctrl+C の "c" が TextEdit に
     /// 流れ込んで文字として挿入されるのも防ぐ。
+    ///
+    /// 転送条件（09: Ctrl キーガード）:
+    /// 1. フォーカスガード: 入力行以外のウィジェット（検索欄・rename 等）にフォーカスが
+    ///    ある場合は consume せず return する（それらの Ctrl 入力を奪わない）。
+    /// 2. busy ガード: アクティブセッションの直近ブロックが running の時のみ転送する。
+    ///    idle 中の Ctrl+C/D/Z/\ は consume も転送もしない（idle zsh への EOF 誤送防止）。
     fn forward_pty_control_keys(&mut self, ctx: &egui::Context) {
+        // フォーカスガード（09）: 入力行以外のウィジェットにフォーカスがある場合は何もしない。
+        let focused_elsewhere =
+            ctx.memory(|m| m.focused().is_some_and(|id| id != ui::central::input_id()));
+        // busy ガード（09）: アクティブセッションの直近ブロックが実行中のときのみ転送する。
+        let busy = ui::central::has_running(&self.state);
+
+        if !should_forward_ctrl(focused_elsewhere, busy) {
+            return;
+        }
+
         const BINDINGS: &[(egui::Key, u8)] = &[
             (egui::Key::C, 0x03),         // ETX  / SIGINT
             (egui::Key::D, 0x04),         // EOT  / EOF
@@ -248,6 +264,16 @@ impl TanaTermApp {
             self.state.push_pty_send_raw(vec![byte]);
         }
     }
+}
+
+/// Ctrl 制御キーを PTY へ転送してよいか判定する純関数（09: Ctrl キーガード）。
+///
+/// - `focused_elsewhere`: 入力行以外のウィジェットにフォーカスがある。
+/// - `busy`: アクティブセッションの直近ブロックが実行中。
+///
+/// 転送してよい（true）のは「busy かつ入力行以外にフォーカスがない」場合のみ。
+fn should_forward_ctrl(focused_elsewhere: bool, busy: bool) -> bool {
+    busy && !focused_elsewhere
 }
 
 /// Toast 描画用に CentralPanel 領域を概算する。左右 rail と top/bottom bar を除いた残り。
@@ -335,5 +361,34 @@ fn register_cjk_fallback(ctx: &egui::Context) {
         }
         ctx.set_fonts(fonts);
         return;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_forward_ctrl;
+
+    /// Ctrl 転送判定の真理値表（09: Ctrl キーガード）。
+    #[test]
+    fn should_forward_ctrl_truth_table() {
+        // busy かつ非 focused_elsewhere の時のみ true。
+        assert!(
+            should_forward_ctrl(false, true),
+            "busy かつフォーカス通常 → 転送する"
+        );
+        // idle 中は転送しない（idle zsh への EOF 誤送を防ぐ）。
+        assert!(
+            !should_forward_ctrl(false, false),
+            "idle かつフォーカス通常 → 転送しない"
+        );
+        // 他ウィジェットにフォーカスがある時は転送しない。
+        assert!(
+            !should_forward_ctrl(true, true),
+            "busy だが他ウィジェットにフォーカス → 転送しない"
+        );
+        assert!(
+            !should_forward_ctrl(true, false),
+            "idle かつ他ウィジェットにフォーカス → 転送しない"
+        );
     }
 }
