@@ -10,7 +10,7 @@
 
 use eframe::egui;
 
-use crate::state::AppState;
+use crate::state::{matches_query, AppState};
 use crate::theme;
 use crate::ui::widgets::{self, row, status_dot, text_button, Icon, RowState};
 
@@ -36,7 +36,14 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(14.0);
-                    widgets::section_header(ui, "SESSIONS", state.sessions.len());
+                    // フィルタ後の件数をカウントして section_header に渡す。
+                    let q = state.ui.search_query.clone();
+                    let sessions_count = state
+                        .sessions
+                        .iter()
+                        .filter(|s| matches_query(&q, &[s.name.as_str(), s.pwd.as_str()]))
+                        .count();
+                    widgets::section_header(ui, "SESSIONS", sessions_count);
                     if text_button(ui, "+ new session", Some("⌘T")) {
                         state.new_session("new session", "~/");
                         let now = ui.input(|i| i.time);
@@ -51,7 +58,14 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(14.0);
-                    widgets::section_header(ui, "SHELF", state.shelf.len());
+                    // フィルタ後の件数をカウントして section_header に渡す。
+                    let q = state.ui.search_query.clone();
+                    let shelf_count = state
+                        .shelf
+                        .iter()
+                        .filter(|s| matches_query(&q, &[s.label.as_str(), s.path.as_str()]))
+                        .count();
+                    widgets::section_header(ui, "SHELF", shelf_count);
                     if text_button(ui, "★ add current folder", None) {
                         let now = ui.input(|i| i.time);
                         state.add_active_to_shelf(now);
@@ -63,7 +77,14 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
 }
 
 fn sessions_list(ui: &mut egui::Ui, state: &mut AppState) {
-    let session_ids: Vec<String> = state.sessions.iter().map(|s| s.id.clone()).collect();
+    // クエリでフィルタした id 列を ScrollArea の外で確定する。
+    let q = state.ui.search_query.clone();
+    let session_ids: Vec<String> = state
+        .sessions
+        .iter()
+        .filter(|s| matches_query(&q, &[s.name.as_str(), s.pwd.as_str()]))
+        .map(|s| s.id.clone())
+        .collect();
     let active_id = state.ui.active_session_id.clone();
     let last_idx = session_ids.len().saturating_sub(1);
 
@@ -77,15 +98,27 @@ fn sessions_list(ui: &mut egui::Ui, state: &mut AppState) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
-            for (i, id) in session_ids.iter().enumerate() {
+            if session_ids.is_empty() {
+                // 検索ヒットなし表示。
                 ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    session_row(ui, state, id, active_id.as_deref() == Some(id), row_w);
+                    ui.add_space(theme::spacing::PAD_X);
+                    ui.label(
+                        egui::RichText::new("no matches")
+                            .size(11.0)
+                            .color(theme::FG_3),
+                    );
                 });
-                ui.add_space(2.0);
-                // アイテム間 hairline（最終行の後には引かない）。
-                if i != last_idx {
-                    widgets::row_hairline(ui);
+            } else {
+                for (i, id) in session_ids.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        session_row(ui, state, id, active_id.as_deref() == Some(id), row_w);
+                    });
+                    ui.add_space(2.0);
+                    // アイテム間 hairline（最終行の後には引かない）。
+                    if i != last_idx {
+                        widgets::row_hairline(ui);
+                    }
                 }
             }
         });
@@ -205,7 +238,14 @@ fn session_row(ui: &mut egui::Ui, state: &mut AppState, id: &str, active: bool, 
 }
 
 fn shelf_list(ui: &mut egui::Ui, state: &mut AppState) {
-    let ids: Vec<String> = state.shelf.iter().map(|s| s.id.clone()).collect();
+    // クエリでフィルタした id 列を ScrollArea の外で確定する。
+    let q = state.ui.search_query.clone();
+    let ids: Vec<String> = state
+        .shelf
+        .iter()
+        .filter(|s| matches_query(&q, &[s.label.as_str(), s.path.as_str()]))
+        .map(|s| s.id.clone())
+        .collect();
     let last_idx = ids.len().saturating_sub(1);
 
     // ScrollArea の外で確定した幅を渡す（widgets::row の不変条件）。
@@ -218,14 +258,26 @@ fn shelf_list(ui: &mut egui::Ui, state: &mut AppState) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
-            for (i, id) in ids.iter().enumerate() {
+            if ids.is_empty() {
+                // 検索ヒットなし表示。
                 ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    shelf_row(ui, state, id, row_w);
+                    ui.add_space(theme::spacing::PAD_X);
+                    ui.label(
+                        egui::RichText::new("no matches")
+                            .size(11.0)
+                            .color(theme::FG_3),
+                    );
                 });
-                ui.add_space(2.0);
-                if i != last_idx {
-                    widgets::row_hairline(ui);
+            } else {
+                for (i, id) in ids.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        shelf_row(ui, state, id, row_w);
+                    });
+                    ui.add_space(2.0);
+                    if i != last_idx {
+                        widgets::row_hairline(ui);
+                    }
                 }
             }
         });

@@ -9,7 +9,7 @@
 use eframe::egui;
 
 use crate::clock;
-use crate::state::{AppState, Command};
+use crate::state::{matches_query, AppState, Command};
 use crate::theme;
 use crate::ui::left_rail::rename_edit;
 use crate::ui::widgets::{self, row, text_button, RowState};
@@ -46,7 +46,20 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(6.0);
-                    widgets::section_header_plain(ui, "PINNED");
+                    // フィルタ後の件数をカウントして section_header に渡す。
+                    let q = state.ui.search_query.clone();
+                    let pinned_count = state
+                        .commands
+                        .iter()
+                        .filter(|c| {
+                            Section::Pinned.contains(c)
+                                && matches_query(
+                                    &q,
+                                    &[c.cmd.as_str(), c.desc.as_deref().unwrap_or("")],
+                                )
+                        })
+                        .count();
+                    widgets::section_header(ui, "PINNED", pinned_count);
                     commands_section(ui, state, Section::Pinned);
                 });
 
@@ -55,7 +68,20 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(6.0);
-                    widgets::section_header_plain(ui, "RECENT");
+                    // フィルタ後の件数をカウントして section_header に渡す。
+                    let q = state.ui.search_query.clone();
+                    let recent_count = state
+                        .commands
+                        .iter()
+                        .filter(|c| {
+                            Section::Recent.contains(c)
+                                && matches_query(
+                                    &q,
+                                    &[c.cmd.as_str(), c.desc.as_deref().unwrap_or("")],
+                                )
+                        })
+                        .count();
+                    widgets::section_header(ui, "RECENT", recent_count);
                     commands_section(ui, state, Section::Recent);
                 });
         });

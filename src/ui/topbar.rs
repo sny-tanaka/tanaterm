@@ -126,7 +126,7 @@ fn search_input(ui: &mut egui::Ui, state: &mut AppState, width: f32) {
                     .frame(false)
                     .text_color(theme::FG_0)
                     .hint_text(
-                        egui::RichText::new("Search sessions, shelf, commands, history…")
+                        egui::RichText::new("Search sessions, shelf, commands…")
                             .color(theme::FG_3)
                             .size(12.0),
                     );

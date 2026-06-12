@@ -265,6 +265,12 @@ impl TanaTermApp {
             if self.state.ui.command_add_active {
                 self.state.cancel_command_add();
             }
+            // 検索欄にフォーカスがある時の Esc は query をクリアしてフォーカスを手放す。
+            let search_focused = ctx.memory(|m| m.focused() == Some(ui::topbar::search_id()));
+            if search_focused {
+                self.state.ui.search_query.clear();
+                ctx.memory_mut(|m| m.surrender_focus(ui::topbar::search_id()));
+            }
         }
     }
 

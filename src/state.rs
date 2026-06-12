@@ -1257,6 +1257,25 @@ impl AppState {
     }
 }
 
+/// クエリの空白区切り各語が、いずれかのフィールドに（小文字化した）部分一致するか。
+///
+/// - 空クエリは常に `true`。
+/// - 全ての語がどこかのフィールドにヒットした時のみ `true`（AND 検索）。
+/// - 大文字小文字は無視（ASCII 範囲で小文字化して比較）。
+pub fn matches_query(query: &str, fields: &[&str]) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    // フィールドを一度だけ小文字化してキャッシュする。
+    let lowered: Vec<String> = fields.iter().map(|f| f.to_lowercase()).collect();
+    // 空白区切りの各語がいずれかのフィールドに含まれるか（AND）。
+    q.split_whitespace().all(|word| {
+        let w = word.to_lowercase();
+        lowered.iter().any(|f| f.contains(w.as_str()))
+    })
+}
+
 /// `\r` 上書き（プログレスバー）用: ブロック出力の最終行（最後の `'\n'` より後ろ）を削る。
 ///
 /// - span を末尾から走査し、`'\n'` を含む span を見つけたらその span 内の
@@ -2519,5 +2538,60 @@ mod tests {
     fn boot_sets_focus_input_pending() {
         let s = AppState::boot();
         assert!(s.ui.focus_input_pending, "boot でフラグが立つ");
+    }
+
+    // ── 18: matches_query テスト ────────────────────────────────────────────
+
+    /// 空クエリは常に true。
+    #[test]
+    fn matches_query_empty_always_true() {
+        assert!(matches_query("", &["foo", "bar"]), "空クエリは true");
+        assert!(matches_query("   ", &["foo"]), "空白のみも true");
+        assert!(matches_query("", &[]), "フィールドなしでも空クエリは true");
+    }
+
+    /// 大文字小文字を無視して部分一致する。
+    #[test]
+    fn matches_query_case_insensitive() {
+        assert!(
+            matches_query("TANA", &["tanaterm"]),
+            "大文字クエリ → 小文字フィールドにヒット"
+        );
+        assert!(
+            matches_query("tana", &["TANATERM"]),
+            "小文字クエリ → 大文字フィールドにヒット"
+        );
+        assert!(
+            matches_query("Term", &["tanaterm"]),
+            "混在クエリ → 部分一致"
+        );
+    }
+
+    /// 複数語は AND 検索（すべての語がどこかにヒット）。
+    #[test]
+    fn matches_query_multi_word_and() {
+        // 両語がそれぞれ別フィールドにヒットする → true。
+        assert!(
+            matches_query("dev work", &["tanaterm·dev", "~/work/tanaterm"]),
+            "各語が別フィールドにヒット → true"
+        );
+        // 一方の語がどのフィールドにもヒットしない → false。
+        assert!(
+            !matches_query("dev nohit", &["tanaterm·dev", "~/work/tanaterm"]),
+            "どのフィールドにもヒットしない語がある → false"
+        );
+    }
+
+    /// どのフィールドにも当たらない語があれば false。
+    #[test]
+    fn matches_query_no_match_returns_false() {
+        assert!(
+            !matches_query("zzz", &["foo", "bar", "baz"]),
+            "マッチしない語 → false"
+        );
+        assert!(
+            !matches_query("foo bar zzz", &["foo", "bar"]),
+            "一語でもミスなら false"
+        );
     }
 }
