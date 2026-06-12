@@ -9,6 +9,22 @@ use crate::state::{AppState, Block, OutputColor, OutputSpan, Session};
 use crate::theme;
 use crate::ui::widgets::{self, status_dot};
 
+/// `draw_block` がループ後に `state` へ適用するアクション（19: ブロック操作）。
+///
+/// 借用の都合上、`term_area` は `&AppState` で blocks を回しつつ、
+/// ループ後にアクションを 1 件だけ適用する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockAction {
+    /// 何もしない。
+    None,
+    /// 出力テキストをクリップボードにコピーする。
+    Copy { text: String },
+    /// コマンド文字列をクリップボードにコピーする。
+    CopyCmd { cmd: String },
+    /// コマンドをアクティブセッションの入力行にセットして入力行へフォーカスする。
+    RunAgain { cmd: String },
+}
+
 pub fn input_id() -> egui::Id {
     egui::Id::new("tanaterm.central.input")
 }
@@ -239,13 +255,24 @@ fn term_head(ui: &mut egui::Ui, state: &AppState) {
         });
 }
 
-fn term_area(ui: &mut egui::Ui, state: &AppState) {
-    let Some(session) = state.active() else {
+fn term_area(ui: &mut egui::Ui, state: &mut AppState) {
+    // セッション情報を先に借用して必要な値を取り出す（ループ後に state を可変借用するため）。
+    let session_info = state.active().map(|s| {
+        (
+            s.id.clone(),
+            s.blocks.is_empty(),
+            s.blocks.last().is_some_and(|b| b.running),
+        )
+    });
+    let Some((session_id, is_empty, is_last_running)) = session_info else {
         return;
     };
 
-    if session.blocks.is_empty() {
-        empty_placeholder(ui, session);
+    if is_empty {
+        // 空ブロックの placeholder 描画。Session の参照を取り直す。
+        if let Some(session) = state.active() {
+            empty_placeholder(ui, session);
+        }
         return;
     }
 
@@ -254,10 +281,16 @@ fn term_area(ui: &mut egui::Ui, state: &AppState) {
     // 最新ブロックが下端に張り付き、超えると spacer が 0 になって通常スクロール。
     // `Layout::bottom_up` を使わないのは、その中で `ui.horizontal()` 配下の multi-line
     // テキスト（ls 出力など）の wrap 計算が崩れて行が重なって描画されるため。
-    let cache_id = egui::Id::new(("term_area_content_h", &session.id));
+    let cache_id = egui::Id::new(("term_area_content_h", &session_id));
     let viewport_h = ui.available_height();
     let prev_content_h: f32 = ui.memory(|m| m.data.get_temp(cache_id).unwrap_or(0.0_f32));
     let filler = (viewport_h - prev_content_h).max(0.0);
+
+    let font_size = state.ui.font_size;
+
+    // ブロック情報をイミュータブルで借用してリストを描画し、アクション（BlockAction）を収集する。
+    // ループ後に state への可変参照を得てアクションを適用する（借用の都合）。
+    let mut pending_action = BlockAction::None;
 
     egui::ScrollArea::vertical()
         .id_source("term_area")
@@ -274,10 +307,15 @@ fn term_area(ui: &mut egui::Ui, state: &AppState) {
             // docs/redesign.md §4: ブロック間に余白 + 1px hairline を入れる。
             // 最終ブロック後は hairline 無しで余白のみ（外枠の divider と二重に
             // ならないようにする）。
+            let session = state.active().unwrap();
             let last = session.blocks.len().saturating_sub(1);
-            let font_size = state.ui.font_size;
             for (i, block) in session.blocks.iter().enumerate() {
-                draw_block(ui, block, font_size);
+                // busy 時（直近ブロック running）は全ブロックで run again を非表示にする。
+                let can_run_again = !is_last_running;
+                let action = draw_block(ui, block, font_size, can_run_again);
+                if action != BlockAction::None {
+                    pending_action = action;
+                }
                 if i != last {
                     ui.add_space(4.0);
                     block_divider(ui);
@@ -289,6 +327,27 @@ fn term_area(ui: &mut egui::Ui, state: &AppState) {
             let content_h = ui.cursor().top() - content_top;
             ui.memory_mut(|m| m.data.insert_temp(cache_id, content_h));
         });
+
+    // ループ後にアクションを適用する（state の可変借用はここで取得）。
+    let now = ui.input(|i| i.time);
+    match pending_action {
+        BlockAction::None => {}
+        BlockAction::Copy { text } => {
+            ui.ctx().copy_text(text);
+            state.show_toast("出力をコピーしました", None, now);
+        }
+        BlockAction::CopyCmd { cmd } => {
+            ui.ctx().copy_text(cmd);
+            state.show_toast("コマンドをコピーしました", None, now);
+        }
+        BlockAction::RunAgain { cmd } => {
+            if let Some(session) = state.active_mut() {
+                session.input_buffer = cmd;
+                session.history_cursor = None;
+            }
+            state.ui.focus_input_pending = true;
+        }
+    }
 }
 
 /// ターミナルブロック間に引く 1px hairline（左右 12px インセット）。
@@ -331,7 +390,15 @@ fn empty_placeholder(ui: &mut egui::Ui, session: &Session) {
     );
 }
 
-fn draw_block(ui: &mut egui::Ui, block: &Block, font_size: f32) {
+/// ブロック 1 件を描画し、ユーザ操作があれば `BlockAction` を返す（19: ブロック操作）。
+///
+/// `can_run_again`: busy 中（直近ブロック running）は `false` にして "run again" を非表示にする。
+fn draw_block(
+    ui: &mut egui::Ui,
+    block: &Block,
+    font_size: f32,
+    can_run_again: bool,
+) -> BlockAction {
     let running = block.running;
     let err = matches!(block.exit_code, Some(c) if c != 0);
     let border = if running {
@@ -346,21 +413,62 @@ fn draw_block(ui: &mut egui::Ui, block: &Block, font_size: f32) {
     // 先に中身を描いて実際の高さを得てから border を描くことで、
     // border の長さがブロック内容の高さにぴったり揃う（固定高だと余る/足りない）。
     let block_left_pad = 12.0;
+
+    // 折りたたみ状態を egui temp memory で管理する（再起動で展開に戻る）。
+    let collapsed_key = egui::Id::new(("block_collapsed", &block.id));
+    let collapsed: bool = ui.memory(|m| m.data.get_temp(collapsed_key).unwrap_or(false));
+
+    // 前フレームのブロック rect を temp memory から取り出して hover 判定に使う。
+    // （ `ui.horizontal()` 完了後に rect が確定するため、次フレームで判定する方式）
+    let block_rect_key = egui::Id::new(("block_rect", &block.id));
+    let prev_rect: Option<egui::Rect> = ui.memory(|m| m.data.get_temp(block_rect_key));
+    let is_hovered = prev_rect.is_some_and(|r| ui.rect_contains_pointer(r));
+
+    let mut action = BlockAction::None;
+
     let resp = ui.horizontal(|ui| {
         ui.add_space(block_left_pad);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            prompt_line(ui, block);
+            let prompt_action =
+                prompt_line(ui, block, collapsed, can_run_again, is_hovered, &mut action);
+            if let Some(new_collapsed) = prompt_action {
+                ui.memory_mut(|m| m.data.insert_temp(collapsed_key, new_collapsed));
+            }
             cmd_line(ui, block, err, font_size);
-            output(ui, block, font_size);
+            if collapsed {
+                // 折りたたみ中: 行数を数えて Dim で表示する。
+                let line_count: usize = block
+                    .output
+                    .iter()
+                    .map(|s| s.text.chars().filter(|&c| c == '\n').count())
+                    .sum();
+                ui.label(
+                    egui::RichText::new(format!("{line_count} 行を折りたたみ中"))
+                        .color(theme::FG_3)
+                        .size(font_size - 1.0),
+                );
+            } else {
+                output(ui, block, font_size);
+            }
         });
     });
 
+    let block_rect = resp.response.rect;
+
+    // 今フレームの block rect を temp memory に保存し、次フレームの hover 判定に使う。
+    ui.memory_mut(|m| m.data.insert_temp(block_rect_key, block_rect));
+
+    // hover 中はボタン表示のために再描画を要求する。
+    if ui.rect_contains_pointer(block_rect) || is_hovered {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(40));
+    }
+
     if border != egui::Color32::TRANSPARENT {
-        let rect = resp.response.rect;
         let bar = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top()),
-            egui::pos2(rect.left() + 2.0, rect.bottom()),
+            egui::pos2(block_rect.left(), block_rect.top()),
+            egui::pos2(block_rect.left() + 2.0, block_rect.bottom()),
         );
         // 実行中は status_dot と同じ pulse 波形で縦バーを点滅させ、視線を引く。
         // cmd_line 側の spinner も同じ ctx を共有するので、ここの 40ms repaint で
@@ -375,30 +483,127 @@ fn draw_block(ui: &mut egui::Ui, block: &Block, font_size: f32) {
         };
         ui.painter().rect_filled(bar, 1.0, color);
     }
+
+    action
 }
 
-fn prompt_line(ui: &mut egui::Ui, block: &Block) {
-    ui.horizontal_wrapped(|ui| {
+/// prompt_line を描画する。
+///
+/// - `collapsed`: 現在の折りたたみ状態。
+/// - `can_run_again`: busy 中は `false`（"run again" を非表示）。
+/// - `is_hovered`: ブロック全体が hover 中かどうか（draw_block から前フレーム rect で判定）。
+/// - `action`: hover アクション（copy / copy cmd / run again）の書き込み先。
+///
+/// 戻り値: `Some(new_collapsed)` = 折りたたみトグルがクリックされた場合の新しい値、
+///         `None` = 変更なし。
+fn prompt_line(
+    ui: &mut egui::Ui,
+    block: &Block,
+    collapsed: bool,
+    can_run_again: bool,
+    is_hovered: bool,
+    action: &mut BlockAction,
+) -> Option<bool> {
+    // 折りたたみトグルアイコン（▾ = 展開中、▶ = 折りたたみ中）。
+    let triangle = if collapsed { "▶" } else { "▾" };
+    let mut new_collapsed: Option<bool> = None;
+
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(
-            egui::RichText::new("▶")
-                .strong()
-                .color(theme::AMBER)
-                .size(11.5),
+
+        // 折りたたみトグル（▾/▶）。クリックで折りたたみ状態を反転する。
+        let toggle_resp = ui.add(
+            egui::Label::new(
+                egui::RichText::new(triangle)
+                    .strong()
+                    .color(theme::AMBER)
+                    .size(11.5),
+            )
+            .sense(egui::Sense::click()),
         );
+        if toggle_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if toggle_resp.clicked() {
+            new_collapsed = Some(!collapsed);
+        }
+
         ui.label(
             egui::RichText::new(&block.pwd)
                 .color(theme::FG_2)
                 .size(11.5),
         );
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 時刻ラベル（右端に常時表示）。
             ui.label(
                 egui::RichText::new(&block.time)
                     .color(theme::FG_3)
                     .size(10.5),
             );
+
+            // hover 中かつ running でない時のみアクションボタンを表示する（19: ブロック操作）。
+            // right_to_left レイアウトなので、右から左の順に "run again" / "copy cmd" / "copy"。
+            if is_hovered && !block.running {
+                ui.add_space(6.0);
+
+                // "run again" — busy 中は非表示（can_run_again で制御）。
+                if can_run_again {
+                    let run_resp = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("run again")
+                                .color(theme::AMBER)
+                                .size(10.0),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if run_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if run_resp.clicked() {
+                        *action = BlockAction::RunAgain {
+                            cmd: block.cmd.clone(),
+                        };
+                    }
+                    ui.add_space(4.0);
+                }
+
+                // "copy cmd" — コマンド文字列をクリップボードにコピー。
+                let copy_cmd_resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("copy cmd")
+                            .color(theme::AMBER)
+                            .size(10.0),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if copy_cmd_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if copy_cmd_resp.clicked() {
+                    *action = BlockAction::CopyCmd {
+                        cmd: block.cmd.clone(),
+                    };
+                }
+                ui.add_space(4.0);
+
+                // "copy" — 出力テキスト全体をクリップボードにコピー。
+                let copy_resp = ui.add(
+                    egui::Label::new(egui::RichText::new("copy").color(theme::AMBER).size(10.0))
+                        .sense(egui::Sense::click()),
+                );
+                if copy_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if copy_resp.clicked() {
+                    let text: String = block.output.iter().map(|s| s.text.as_str()).collect();
+                    *action = BlockAction::Copy { text };
+                }
+            }
         });
     });
+
+    new_collapsed
 }
 
 fn cmd_line(ui: &mut egui::Ui, block: &Block, err: bool, font_size: f32) {
@@ -465,6 +670,18 @@ fn format_elapsed(secs: u64) -> String {
 
 fn output(ui: &mut egui::Ui, block: &Block, font_size: f32) {
     let mut layout = egui::text::LayoutJob::default();
+    // 出力が切り詰められている場合、先頭に省略バナーを Dim で付ける（19: 出力上限）。
+    if block.trimmed {
+        layout.append(
+            "… 先頭の出力は省略されました …\n",
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::monospace(font_size),
+                color: theme::FG_3,
+                ..Default::default()
+            },
+        );
+    }
     for span in &block.output {
         push_span(&mut layout, span, font_size);
     }

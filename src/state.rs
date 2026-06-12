@@ -47,6 +47,10 @@ pub struct Block {
     /// `None` は「実行中」または「heuristic で exit 不明のまま終了」。`running` と併せて判断する。
     pub exit_code: Option<i32>,
     pub output: Vec<OutputSpan>,
+    /// 出力が上限（`MAX_OUTPUT_CHARS`）を超えて先頭が切り詰められた場合 `true`。
+    /// 描画時に「先頭の出力は省略されました」バナーを表示する（19: 出力上限）。
+    #[serde(default)]
+    pub trimmed: bool,
 }
 
 /// ターミナル出力の 1 色スパン。`tanaterm.css` の `.block .out .X` クラスに対応。
@@ -750,6 +754,7 @@ impl AppState {
             running: true,
             exit_code: None,
             output: Vec::new(),
+            trimmed: false,
         });
         session.status = SessionStatus::Busy;
         self.pending.push(PendingPty::Send {
@@ -827,6 +832,10 @@ impl AppState {
                 }
                 if let Some(b) = self.running_block_mut(id) {
                     b.output.extend(spans);
+                    // 出力上限を超えていたら先頭を切り詰める（19: 出力上限）。
+                    if trim_output_front(&mut b.output, MAX_OUTPUT_CHARS, KEEP_OUTPUT_CHARS) {
+                        b.trimmed = true;
+                    }
                 }
             }
             TermAction::ClearOutput => {
@@ -881,6 +890,10 @@ impl AppState {
                     });
                 }
                 last_block.output.extend(spans);
+                // 出力上限を超えていたら先頭を切り詰める（19: 出力上限）。
+                if trim_output_front(&mut last_block.output, MAX_OUTPUT_CHARS, KEEP_OUTPUT_CHARS) {
+                    last_block.trimmed = true;
+                }
             }
             TermAction::AltScreen(b) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
@@ -1276,6 +1289,142 @@ pub fn matches_query(query: &str, fields: &[&str]) -> bool {
     })
 }
 
+/// 出力上限（19: 出力上限・メモリ保護）。
+///
+/// `output` の総文字数がこの値を超えたら `trim_output_front` で先頭を削る。
+const MAX_OUTPUT_CHARS: usize = 400_000;
+
+/// `trim_output_front` で切り詰めた後に残す目標文字数。
+const KEEP_OUTPUT_CHARS: usize = 300_000;
+
+/// output の総文字数が `max_chars` を超えていたら、先頭の span から削って
+/// `keep_chars` 程度まで縮める。切り口は行境界（`'\n'` の直後）に揃える。
+/// 削った場合 `true` を返す。
+///
+/// ## アルゴリズム
+/// 1. `chars_to_drop = total - keep_chars` 文字分を先頭から削る位置を決める。
+/// 2. その位置までの文字列（削り対象）の中で**最後の** `'\n'` を探す。
+///    - 見つかれば、その `'\n'` の直後を切り口にする（削り量を最小化して行境界に揃える）。
+///    - 見つからなければ `chars_to_drop` 文字目より後の最初の `'\n'` の直後を切り口にする。
+/// 3. 切り口以前を全て削除する。
+pub(crate) fn trim_output_front(
+    output: &mut Vec<OutputSpan>,
+    max_chars: usize,
+    keep_chars: usize,
+) -> bool {
+    // 総文字数を算出する。
+    let total: usize = output.iter().map(|s| s.text.chars().count()).sum();
+    if total <= max_chars {
+        return false;
+    }
+
+    // 先頭から削る文字数（バイト数ではなく文字数で管理し、その後で行境界に揃える）。
+    let chars_to_drop = total.saturating_sub(keep_chars);
+
+    // 削り対象（先頭 chars_to_drop 文字）の全文字列を結合して rfind('\n') で
+    // 最後の行境界を探す。見つかれば、その直後を切り口にする（削り量最小化）。
+    // 見つからなければ chars_to_drop 以降で最初の '\n' 直後を探す。
+    //
+    // 切り口 = output の先頭から数えた「文字インデックス」で表す。
+    let cut_char_idx: usize;
+
+    // 削り対象の文字列を結合する（chars_to_drop 文字分）。
+    let mut prefix_str = String::with_capacity(chars_to_drop);
+    let mut collected = 0usize;
+    for span in output.iter() {
+        if collected >= chars_to_drop {
+            break;
+        }
+        let need = chars_to_drop - collected;
+        let span_chars = span.text.chars().count();
+        if span_chars <= need {
+            prefix_str.push_str(&span.text);
+            collected += span_chars;
+        } else {
+            // span の途中まで。
+            let partial: String = span.text.chars().take(need).collect();
+            prefix_str.push_str(&partial);
+            collected += need;
+        }
+    }
+
+    if let Some(nl_byte_pos) = prefix_str.rfind('\n') {
+        // 削り対象内の最後の '\n' の直後を切り口にする（削り量最小化）。
+        // nl_byte_pos はバイト位置 → 文字インデックスに変換する。
+        cut_char_idx = prefix_str[..nl_byte_pos + 1].chars().count();
+    } else {
+        // 削り対象内に '\n' が無い → chars_to_drop 以降で最初の '\n' を探す。
+        // 全 span の chars_to_drop 文字目以降を走査する。
+        let mut idx = 0usize;
+        let mut found = None;
+        'forward: for span in output.iter() {
+            let span_chars = span.text.chars().count();
+            let span_start = idx;
+            let span_end = idx + span_chars;
+            if span_end <= chars_to_drop {
+                // この span は丸ごと削り対象内。
+                idx = span_end;
+                continue;
+            }
+            // chars_to_drop の境界がこの span 内にある（または span 全体が境界以降）。
+            let offset_in_span = chars_to_drop.saturating_sub(span_start);
+            // この span の offset_in_span 文字目以降で '\n' を探す。
+            let after: String = span.text.chars().skip(offset_in_span).collect();
+            if let Some(nl_pos) = after.find('\n') {
+                // nl_pos はバイト位置。文字数に変換する。
+                let nl_char_count = after[..nl_pos + 1].chars().count();
+                found = Some(span_start + offset_in_span + nl_char_count);
+                break 'forward;
+            }
+            idx = span_end;
+        }
+        match found {
+            Some(c) => cut_char_idx = c,
+            None => {
+                // '\n' が見つからない → output 全体をクリア。
+                output.clear();
+                return true;
+            }
+        }
+    }
+
+    if cut_char_idx == 0 {
+        // 切り口が先頭 → 実質何も削らない（行境界が先頭にある場合）。
+        // ただし max_chars を超えているのに 0 にはなりにくいが防衛的に処理する。
+        return true;
+    }
+
+    // cut_char_idx 文字目より前を全て削除する。
+    // span を先頭から走査して cut_char_idx に達するまで削る。
+    let mut remaining_cut = cut_char_idx;
+    loop {
+        if output.is_empty() {
+            break;
+        }
+        let span_chars = output[0].text.chars().count();
+        if span_chars <= remaining_cut {
+            // この span を丸ごと削除する。
+            output.remove(0);
+            remaining_cut -= span_chars;
+        } else {
+            // この span の途中まで削る。
+            let byte_offset: usize = output[0]
+                .text
+                .char_indices()
+                .nth(remaining_cut)
+                .map(|(b, _)| b)
+                .unwrap_or(output[0].text.len());
+            output[0].text = output[0].text[byte_offset..].to_string();
+            break;
+        }
+    }
+
+    // 空 span を除去する。
+    output.retain(|s| !s.text.is_empty());
+
+    true
+}
+
 /// `\r` 上書き（プログレスバー）用: ブロック出力の最終行（最後の `'\n'` より後ろ）を削る。
 ///
 /// - span を末尾から走査し、`'\n'` を含む span を見つけたらその span 内の
@@ -1344,6 +1493,7 @@ mod seed {
                             span(OutputColor::Dim, "   8 tanaka  staff   256 May 21 14:00 "),
                             span(OutputColor::Default, "src\n"),
                         ],
+                        trimmed: false,
                     },
                     Block {
                         id: "b2".into(),
@@ -1361,6 +1511,7 @@ mod seed {
                             span(OutputColor::Sage, "✓ "),
                             span(OutputColor::Default, "0 errors  · 3.42s\n"),
                         ],
+                        trimmed: false,
                     },
                     Block {
                         id: "b3".into(),
@@ -1381,6 +1532,7 @@ mod seed {
                             span(OutputColor::Sage, "  ➜  "),
                             span(OutputColor::Default, "Network: use --host to expose\n"),
                         ],
+                        trimmed: false,
                     },
                 ],
                 shell: crate::config::Shell::default(),
@@ -1408,6 +1560,7 @@ mod seed {
                     running: true,
                     exit_code: None,
                     output: vec![span(OutputColor::Dim, "Streaming logs…")],
+                    trimmed: false,
                 }],
                 shell: crate::config::Shell::default(),
                 cwd: None,
@@ -2538,6 +2691,76 @@ mod tests {
     fn boot_sets_focus_input_pending() {
         let s = AppState::boot();
         assert!(s.ui.focus_input_pending, "boot でフラグが立つ");
+    }
+
+    // ── 19: trim_output_front テスト ─────────────────────────────────────────
+
+    fn make_span(text: &str) -> OutputSpan {
+        OutputSpan {
+            color: OutputColor::Default,
+            text: text.to_string(),
+        }
+    }
+
+    /// 総文字数が上限以下なら何もしない（false を返す）。
+    #[test]
+    fn trim_output_front_no_op_when_under_limit() {
+        let mut output = vec![make_span("hello\nworld\n")];
+        let result = trim_output_front(&mut output, 400_000, 300_000);
+        assert!(!result, "上限未満では false を返す");
+        assert_eq!(output.len(), 1, "内容は変わらない");
+        assert_eq!(output[0].text, "hello\nworld\n");
+    }
+
+    /// 上限超過時に先頭が削れ、keep_chars 以下になること。
+    #[test]
+    fn trim_output_front_trims_when_over_limit() {
+        // 小さな上限で動作確認する。
+        // 20 文字超えたら 10 文字に縮める設定。
+        let text_a = "aaaa\nbbbb\n"; // 10 文字
+        let text_b = "cccc\ndddd\n"; // 10 文字
+        let text_c = "eeee\nffff\n"; // 10 文字（合計 30 文字 > max 20）
+        let mut output = vec![make_span(text_a), make_span(text_b), make_span(text_c)];
+        let result = trim_output_front(&mut output, 20, 10);
+        assert!(result, "上限超過では true を返す");
+        // 残った文字数が keep_chars 以下に縮んでいること。
+        let remaining: usize = output.iter().map(|s| s.text.chars().count()).sum();
+        assert!(
+            remaining <= 20,
+            "切り詰め後の文字数 {remaining} は max 以下のはず"
+        );
+    }
+
+    /// 切り口が行頭（直前が '\n'）に揃うこと。
+    #[test]
+    fn trim_output_front_aligns_to_line_boundary() {
+        // max=5, keep=3 → 先頭 2 文字を削りたいが、行境界に揃える。
+        // "ab\ncd\nef" (9 chars) を max=7, keep=5 で → 先頭 2 char 削って行境界へ。
+        // 最初の '\n' は 2 文字目なので、切り口は 3 文字目（'c' の前、'\n' の直後）になる。
+        let mut output = vec![make_span("ab\ncd\nef")];
+        let result = trim_output_front(&mut output, 7, 5);
+        assert!(result, "true を返す");
+        let text: String = output.iter().map(|s| s.text.as_str()).collect();
+        // 切り口は '\n' の直後 → "cd\nef" が残るはず。
+        assert!(
+            text.starts_with("cd\n") || text == "cd\nef",
+            "行境界で切れる: {text:?}"
+        );
+        // 先頭は '\n' の直後（行頭）であること: 直前文字は無いか '\n'。
+        assert!(
+            !text.starts_with('\n'),
+            "先頭に余分な改行が残らない: {text:?}"
+        );
+    }
+
+    /// 削った場合の戻り値が true。
+    #[test]
+    fn trim_output_front_returns_true_when_trimmed() {
+        let big = "x".repeat(10);
+        let mut output: Vec<OutputSpan> = (0..5).map(|_| make_span(&big)).collect();
+        // 40 文字 > max=20, keep=10 。
+        let result = trim_output_front(&mut output, 20, 10);
+        assert!(result, "削った場合は true");
     }
 
     // ── 18: matches_query テスト ────────────────────────────────────────────
