@@ -87,6 +87,7 @@ pub struct Session {
     #[serde(default)]
     pub pinned: bool,
     /// ssh 等の remote セッションで "user@host" を入れる。ローカルなら None。
+    /// 現状 UI 表示のみで接続機能は未実装。seed からも外している。
     #[serde(default)]
     pub remote: Option<String>,
     /// `node v22.16.0` のような runtime ラベル（任意）。
@@ -95,6 +96,10 @@ pub struct Session {
     /// このセッションで実行されたコマンドブロック群。新しいほど末尾。
     #[serde(default)]
     pub blocks: Vec<Block>,
+    /// このセッションを起動したシェル。spawn 時に記録し、restart でも同じシェルを使う。
+    /// `serde(default)` で旧バージョンからの移行時は `Shell::default()` が入る。
+    #[serde(default)]
+    pub shell: crate::config::Shell,
     /// OSC 7 で追跡する実 cwd（Tab 補完・表示用）。未取得なら `None`。
     #[serde(skip)]
     pub cwd: Option<std::path::PathBuf>,
@@ -294,7 +299,7 @@ pub struct PersistentState {
     pub font_size: f32,
 }
 
-/// 永続化するセッションの最小情報（name / pwd / pinned）。blocks は復元しない。
+/// 永続化するセッションの最小情報（name / pwd / pinned / shell）。blocks は復元しない。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentSession {
     pub id: String,
@@ -302,6 +307,9 @@ pub struct PersistentSession {
     pub pwd: String,
     #[serde(default)]
     pub pinned: bool,
+    /// このセッションを起動したシェル。再起動時に同じシェルを使うために保存する。
+    #[serde(default)]
+    pub shell: crate::config::Shell,
 }
 
 fn default_true() -> bool {
@@ -393,6 +401,7 @@ impl AppState {
     pub fn boot() -> Self {
         let id = "s1".to_string();
         let pwd = "~/".to_string();
+        let shell = crate::config::Shell::default();
         let session = Session {
             id: id.clone(),
             name: "session".into(),
@@ -402,6 +411,7 @@ impl AppState {
             remote: None,
             node: None,
             blocks: Vec::new(),
+            shell,
             cwd: None,
             input_buffer: String::new(),
             history: Vec::new(),
@@ -415,6 +425,7 @@ impl AppState {
             commands: seed::commands(),
             ui: UiState {
                 active_session_id: Some(id.clone()),
+                shell,
                 ..UiState::default()
             },
             next_id: default_id_counter(),
@@ -433,6 +444,7 @@ impl AppState {
                     name: s.name.clone(),
                     pwd: s.pwd.clone(),
                     pinned: s.pinned,
+                    shell: s.shell,
                 })
                 .collect(),
             active_session_id: self.ui.active_session_id.clone(),
@@ -470,6 +482,7 @@ impl AppState {
                 remote: None,
                 node: None,
                 blocks: Vec::new(),
+                shell: ps.shell,
                 cwd: None,
                 input_buffer: String::new(),
                 history: Vec::new(),
@@ -584,9 +597,11 @@ impl AppState {
 
     /// 新規セッションを末尾に追加して active にし、PTY 起動を `pending` に積む。
     /// `label` は表示名、`pwd` は初期 cwd（shelf クリック時はそのパス、`⌘T` 時は `~/`）。
+    /// 起動シェルは生成時の `ui.shell` を記録する。
     pub fn new_session(&mut self, label: impl Into<String>, pwd: impl Into<String>) -> String {
         let id = self.fresh_id("s");
         let pwd = pwd.into();
+        let shell = self.ui.shell;
         let session = Session {
             id: id.clone(),
             name: label.into(),
@@ -596,6 +611,7 @@ impl AppState {
             remote: None,
             node: None,
             blocks: Vec::new(),
+            shell,
             cwd: None,
             input_buffer: String::new(),
             history: Vec::new(),
@@ -1324,6 +1340,7 @@ mod seed {
                         ],
                     },
                 ],
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: vec!["ls -la".into(), "pnpm typecheck".into(), "pnpm dev".into()],
@@ -1349,6 +1366,7 @@ mod seed {
                     exit_code: None,
                     output: vec![span(OutputColor::Dim, "Streaming logs…")],
                 }],
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: vec!["docker compose logs -f api".into()],
@@ -1365,6 +1383,7 @@ mod seed {
                 remote: None,
                 node: None,
                 blocks: Vec::new(),
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: Vec::new(),
@@ -1381,6 +1400,7 @@ mod seed {
                 remote: Some("tanaka@prod-01".into()),
                 node: None,
                 blocks: Vec::new(),
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: Vec::new(),
@@ -1397,6 +1417,7 @@ mod seed {
                 remote: None,
                 node: None,
                 blocks: Vec::new(),
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: Vec::new(),
@@ -1994,6 +2015,7 @@ mod tests {
                 name: "old".into(),
                 pwd: "~/".into(),
                 pinned: false,
+                shell: crate::config::Shell::default(),
             }],
             ..Default::default()
         };
@@ -2329,6 +2351,47 @@ mod tests {
         assert_eq!(
             restored.ui.font_size, 16.0,
             "from_persistent で font_size が復元される"
+        );
+    }
+
+    // ── 13: Session.shell 記録テスト ─────────────────────────────────────────
+
+    /// `new_session` が呼び出し時の `ui.shell` をセッションに記録すること。
+    #[test]
+    fn new_session_records_current_ui_shell() {
+        let mut s = fresh();
+        // bash に切り替えてからセッションを作る。
+        s.ui.shell = crate::config::Shell::Bash;
+        let id = s.new_session("test", "~/");
+        let session = s.sessions.iter().find(|x| x.id == id).unwrap();
+        assert_eq!(
+            session.shell,
+            crate::config::Shell::Bash,
+            "new_session は作成時の ui.shell を記録する"
+        );
+    }
+
+    /// PersistentState 往復で各セッションの `shell` が保存・復元されること。
+    #[test]
+    fn persistent_roundtrip_preserves_session_shell() {
+        let mut s = fresh();
+        // s1 は Zsh（デフォルト）、s2 は Bash に設定する。
+        s.sessions.iter_mut().find(|x| x.id == "s1").unwrap().shell = crate::config::Shell::Zsh;
+        s.sessions.iter_mut().find(|x| x.id == "s2").unwrap().shell = crate::config::Shell::Bash;
+
+        let restored = AppState::from_persistent(s.to_persistent());
+
+        let r1 = restored.sessions.iter().find(|x| x.id == "s1").unwrap();
+        assert_eq!(
+            r1.shell,
+            crate::config::Shell::Zsh,
+            "s1 は Zsh で復元される"
+        );
+        let r2 = restored.sessions.iter().find(|x| x.id == "s2").unwrap();
+        assert_eq!(
+            r2.shell,
+            crate::config::Shell::Bash,
+            "s2 は Bash で復元される"
         );
     }
 }

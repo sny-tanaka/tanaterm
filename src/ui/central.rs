@@ -510,25 +510,44 @@ fn input_row(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn input_meta(ui: &mut egui::Ui, state: &mut AppState) {
-    let Some((pwd, hist_len, busy_cmd, shell_exited)) = state.active().map(|s| {
+    let Some((pwd, hist_len, busy_cmd, shell_exited, session_shell)) = state.active().map(|s| {
         let busy = s.blocks.last().filter(|b| b.running).map(|b| b.cmd.clone());
-        (s.pwd.clone(), s.history.len(), busy, s.shell_exited)
+        (
+            s.pwd.clone(),
+            s.history.len(),
+            busy,
+            s.shell_exited,
+            s.shell,
+        )
     }) else {
         return;
     };
-    let shell_label = match state.ui.shell {
+    // shell pill はアクティブセッションの実シェルを表示する（13: セッション準拠）。
+    let shell_label = match session_shell {
         crate::config::Shell::Zsh => "zsh",
         crate::config::Shell::Bash => "bash",
+    };
+    // トグル後に新規セッションで使われるシェル名（toast に表示）。
+    let next_shell_label = match state.ui.shell {
+        crate::config::Shell::Zsh => "bash",
+        crate::config::Shell::Bash => "zsh",
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         ui.label(egui::RichText::new("▶").color(theme::AMBER).size(11.0));
         ui.label(egui::RichText::new(pwd).color(theme::FG_1).size(11.0));
-        // shell pill はクリックで zsh↔bash トグル（切替導線）。
-        let shell_resp =
-            pill(ui, shell_label, false, true).on_hover_text("click to switch shell (zsh / bash)");
+        // shell pill はクリックでグローバルトグル。既存セッションは変わらないため
+        // toast で「新規セッションに適用される」ことを明示する（13: セッション準拠）。
+        let shell_resp = pill(ui, shell_label, false, true)
+            .on_hover_text("next sessions: click to switch shell (zsh / bash)");
         if shell_resp.clicked() {
             state.toggle_shell();
+            let now = ui.input(|i| i.time);
+            state.show_toast(
+                format!("new sessions will use {next_shell_label}"),
+                None,
+                now,
+            );
         }
         pill(ui, "tana", true, false);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

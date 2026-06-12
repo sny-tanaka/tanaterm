@@ -115,11 +115,18 @@ impl TanaTermApp {
         if self.state.pending.is_empty() {
             return;
         }
-        // 起動シェルは入力行のトグル（UiState.shell）を反映する（plan 2.1）。
-        let shell = self.state.ui.shell;
         for action in std::mem::take(&mut self.state.pending) {
             match action {
                 PendingPty::Spawn { id, cwd } => {
+                    // 起動シェルはセッション固有の shell を使う（13: セッション準拠）。
+                    // セッションが見つからなければグローバル ui.shell にフォールバック。
+                    let shell = self
+                        .state
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| s.shell)
+                        .unwrap_or(self.state.ui.shell);
                     // rows/cols は spawn 直前の has_running 状態を反映するように
                     // ここで都度計算する。pending に Spawn + Send が並んだ時、Send 側で
                     // 直近ブロックが running 化される前後で行高が変わる可能性に備える。
