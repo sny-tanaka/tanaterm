@@ -987,10 +987,17 @@ impl AppState {
             return;
         };
 
+        // シェルの慣例に合わせ、prefix が '.' で始まる場合のみ dotfile（'.'' 始まり）を候補に含める。
+        // それ以外では '.' 始まりのエントリを除外して補完候補が汚れるのを防ぐ（16: dotfile 除外）。
+        let include_dotfiles = prefix.starts_with('.');
         let mut matches: Vec<(String, bool)> = entries
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
+                // dotfile の除外判定: prefix が '.' で始まらない場合、'.' 始まりのエントリを除外。
+                if !include_dotfiles && name.starts_with('.') {
+                    return None;
+                }
                 if name.starts_with(prefix) {
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     Some((name, is_dir))
@@ -2395,5 +2402,78 @@ mod tests {
             crate::config::Shell::Bash,
             "s2 は Bash で復元される"
         );
+    }
+
+    // ── 16: Tab 補完 dotfile 除外テスト ─────────────────────────────────────
+
+    /// prefix が空（空白区切りトークン終わり）の場合、.hidden は除外され visible.txt が補完される。
+    #[test]
+    fn tab_complete_excludes_dotfiles_when_prefix_is_not_dot() {
+        use std::fs;
+
+        // 一意のテスト用ディレクトリを作成する。
+        let dir = std::env::temp_dir().join(format!(
+            "tanaterm_test_dotfile_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".hidden"), "").unwrap();
+        fs::write(dir.join("visible.txt"), "").unwrap();
+
+        let mut s = fresh();
+        // セッションの cwd をテストディレクトリに向ける。
+        if let Some(sess) = s.active_mut() {
+            sess.cwd = Some(dir.clone());
+            // prefix 空（"cat " の末尾トークンが空）の場合。
+            sess.input_buffer = "cat ".to_string();
+        }
+        s.tab_complete();
+        let buf = s.active().unwrap().input_buffer.clone();
+        assert!(
+            buf.contains("visible.txt"),
+            "prefix 空では visible.txt が補完される: {buf:?}"
+        );
+        assert!(
+            !buf.contains(".hidden"),
+            "prefix 空では .hidden に引っ張られない: {buf:?}"
+        );
+
+        // テスト用ディレクトリを削除。
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// prefix が '.' で始まる場合、.hidden が候補に含まれて補完される。
+    #[test]
+    fn tab_complete_includes_dotfiles_when_prefix_starts_with_dot() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tanaterm_test_dotfile2_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".hidden"), "").unwrap();
+        fs::write(dir.join("visible.txt"), "").unwrap();
+
+        let mut s = fresh();
+        if let Some(sess) = s.active_mut() {
+            sess.cwd = Some(dir.clone());
+            // prefix が "." の場合。
+            sess.input_buffer = "cat .".to_string();
+        }
+        s.tab_complete();
+        let buf = s.active().unwrap().input_buffer.clone();
+        assert!(
+            buf.contains(".hidden"),
+            "prefix '.' では .hidden が補完される: {buf:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
