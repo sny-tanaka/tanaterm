@@ -129,6 +129,7 @@ impl TanaTermApp {
                         SpawnSpec {
                             shell,
                             login_shell: self.config.login_shell,
+                            program: self.config.shell_program(shell),
                             cwd: pty::expand_path(&cwd),
                             rows,
                             cols,

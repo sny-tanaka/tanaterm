@@ -22,6 +22,8 @@ use crate::term::SessionTerm;
 pub struct SpawnSpec {
     pub shell: Shell,
     pub login_shell: bool,
+    /// シェル実行ファイルのパス。`Config::shell_program` で解決済みのものを渡す。
+    pub program: PathBuf,
     /// 初期 cwd（実パス）。`None` なら `$HOME`。
     pub cwd: Option<PathBuf>,
     pub rows: u16,
@@ -135,6 +137,7 @@ impl PtySession {
         let SpawnSpec {
             shell,
             login_shell,
+            program,
             cwd,
             rows,
             cols,
@@ -156,7 +159,7 @@ impl PtySession {
             }
         };
 
-        let mut cmd = CommandBuilder::new(shell.program());
+        let mut cmd = CommandBuilder::new(program);
         let suppress_login = integration.as_ref().is_some_and(|i| i.suppress_login);
         if login_shell && !suppress_login {
             cmd.arg("-l");
@@ -288,6 +291,7 @@ mod tests {
             SpawnSpec {
                 shell: Shell::Zsh,
                 login_shell: true,
+                program: PathBuf::from(Shell::Zsh.program()),
                 cwd: std::env::var_os("HOME").map(PathBuf::from),
                 rows: 24,
                 cols: 80,
