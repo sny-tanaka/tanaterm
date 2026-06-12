@@ -941,6 +941,22 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                     {
                         r.request_focus();
                         state.ui.focus_input_pending = false;
+                        // insert_command 後に placeholder 選択範囲がある場合は TextEditState に
+                        // 反映する（21: placeholder 選択）。TextEdit を add した直後のフレームで
+                        // 状態が確定しているため、request_focus と同じフレームで設定する。
+                        if let Some((a, b)) = state.ui.input_select_range.take() {
+                            if let Some(mut te_state) =
+                                egui::TextEdit::load_state(ui.ctx(), input_id())
+                            {
+                                te_state.cursor.set_char_range(Some(
+                                    egui::text_selection::CCursorRange::two(
+                                        egui::text::CCursor::new(a),
+                                        egui::text::CCursor::new(b),
+                                    ),
+                                ));
+                                te_state.store(ui.ctx(), input_id());
+                            }
+                        }
                     }
                     // singleline は Enter でフォーカスを失うため、その瞬間は has_focus() が
                     // false になる。Enter は lost_focus() + キー押下で検出する（egui の定石）。

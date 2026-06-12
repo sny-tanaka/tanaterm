@@ -229,6 +229,10 @@ pub struct UiState {
     /// rename 中または command_add_active 中はフラグを保留したまま消化しない。
     #[serde(skip)]
     pub focus_input_pending: bool,
+    /// insert_command 後に入力行 TextEdit で選択すべき char 範囲（21: placeholder 選択）。
+    /// `central.rs::input_line` が TextEditState に適用してフラグを下ろす。
+    #[serde(skip)]
+    pub input_select_range: Option<(usize, usize)>,
     /// 表示中の toast（`ctx.input(|i| i.time)` 基準で TTL 経過後に消える）。
     #[serde(skip)]
     pub toast: Option<Toast>,
@@ -251,6 +255,7 @@ impl Default for UiState {
             command_add_desc: String::new(),
             command_add_focus_pending: false,
             focus_input_pending: false,
+            input_select_range: None,
             toast: None,
         }
     }
@@ -1078,6 +1083,8 @@ impl AppState {
 
     /// 右 rail のコマンドをアクティブセッションの input_buffer に挿入する。
     /// 既存入力があっても上書きする（仕様: "insert" 挙動）。
+    /// placeholder（`$識別子`）があれば最初の範囲を `input_select_range` にセットし、
+    /// `focus_input_pending` を立てる（21: placeholder 選択）。
     pub fn insert_command(&mut self, cmd_id: &str, now: f64) {
         let Some(text) = self
             .commands
@@ -1091,6 +1098,13 @@ impl AppState {
             session.input_buffer = text.clone();
             session.history_cursor = None;
         }
+        // placeholder があれば選択範囲をセットして入力行にフォーカスする（21）。
+        if let Some(range) = first_placeholder_range(&text) {
+            self.ui.input_select_range = Some(range);
+        } else {
+            self.ui.input_select_range = None;
+        }
+        self.ui.focus_input_pending = true;
         self.show_toast(format!("Inserted {text}"), None, now);
     }
 
@@ -1282,6 +1296,32 @@ impl AppState {
         });
         self.show_toast(format!("Added \"{label}\" to shelf"), Some(path), now);
     }
+}
+
+/// 文字列中の最初の `$識別子`（'$' + [A-Za-z_][A-Za-z0-9_]*）の char 範囲
+/// （開始 char index, 終了 char index = 排他的）を返す。無ければ None。
+///
+/// `$1` のような数字始まりや `$` 単独は対象外。regex は使わず手書きスキャン（21: placeholder 選択）。
+pub fn first_placeholder_range(s: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '$' {
+            // '$' の次の文字が識別子先頭（[A-Za-z_]）かチェックする。
+            let j = i + 1;
+            if j < n && (chars[j].is_ascii_alphabetic() || chars[j] == '_') {
+                // 識別子末尾を探す。
+                let mut k = j + 1;
+                while k < n && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                return Some((i, k));
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// クエリの空白区切り各語が、いずれかのフィールドに（小文字化した）部分一致するか。
@@ -2880,6 +2920,97 @@ mod tests {
             ps3.history.last().map(String::as_str),
             Some("cmd249"),
             "末尾は cmd249"
+        );
+    }
+
+    // ── 21: first_placeholder_range テスト ────────────────────────────────────
+
+    /// placeholder を含む文字列からの範囲検出。
+    #[test]
+    fn first_placeholder_range_detects_svc() {
+        // "docker compose logs -f $svc" → `$svc` の char 範囲を返す。
+        let s = "docker compose logs -f $svc";
+        let result = first_placeholder_range(s);
+        assert!(result.is_some(), "placeholder が検出されるべき");
+        let (start, end) = result.unwrap();
+        assert_eq!(
+            &s[s.char_indices().nth(start).unwrap().0
+                ..s.char_indices().nth(end).map(|(b, _)| b).unwrap_or(s.len())],
+            "$svc",
+            "検出範囲は '$svc' であるべき: start={start}, end={end}"
+        );
+    }
+
+    /// `$` 単独・数字始まりは対象外。
+    #[test]
+    fn first_placeholder_range_ignores_dollar_alone_and_numeric() {
+        // "$" 単独と "$1" は対象外。
+        assert!(
+            first_placeholder_range("echo $$ $1").is_none(),
+            "$ 単独・$1 は対象外"
+        );
+    }
+
+    /// 有効な placeholder の検出: "grep $name | head"
+    #[test]
+    fn first_placeholder_range_detects_name() {
+        let s = "grep $name | head";
+        let result = first_placeholder_range(s);
+        assert!(result.is_some(), "placeholder が検出されるべき");
+        let (start, end) = result.unwrap();
+        let chars: Vec<char> = s.chars().collect();
+        let got: String = chars[start..end].iter().collect();
+        assert_eq!(got, "$name", "検出範囲は '$name' であるべき");
+    }
+
+    /// placeholder なし → None。
+    #[test]
+    fn first_placeholder_range_returns_none_for_no_placeholder() {
+        assert!(
+            first_placeholder_range("ls -la").is_none(),
+            "placeholder なしは None"
+        );
+        assert!(
+            first_placeholder_range("df -h").is_none(),
+            "シンプルなコマンドは None"
+        );
+    }
+
+    /// `insert_command` が placeholder 範囲と focus フラグをセットする。
+    #[test]
+    fn insert_command_sets_select_range_and_focus_pending() {
+        let mut s = fresh();
+        s.ui.focus_input_pending = false;
+        s.ui.input_select_range = None;
+        // seed の c3 = "ps aux | grep $name"
+        s.insert_command("c3", 0.0);
+        assert!(
+            s.ui.focus_input_pending,
+            "insert_command で focus_input_pending が立つ"
+        );
+        assert!(
+            s.ui.input_select_range.is_some(),
+            "placeholder ありで input_select_range がセットされる"
+        );
+        let buf = s.active().unwrap().input_buffer.clone();
+        assert_eq!(buf, "ps aux | grep $name", "input_buffer にコマンドが入る");
+    }
+
+    /// placeholder がないコマンドの `insert_command` では input_select_range が None。
+    #[test]
+    fn insert_command_no_placeholder_sets_range_none() {
+        let mut s = fresh();
+        s.ui.input_select_range = Some((0, 5)); // 事前に何か入っていても
+                                                // seed の c1 = "df -h"（placeholder なし）
+        s.insert_command("c1", 0.0);
+        assert!(
+            s.ui.input_select_range.is_none(),
+            "placeholder なしなら input_select_range は None"
+        );
+        // focus_input_pending は立つ（コマンド挿入後は常にフォーカス）
+        assert!(
+            s.ui.focus_input_pending,
+            "placeholder なしでも focus_input_pending は立つ"
         );
     }
 }
