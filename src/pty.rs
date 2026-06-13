@@ -22,6 +22,8 @@ use crate::term::SessionTerm;
 pub struct SpawnSpec {
     pub shell: Shell,
     pub login_shell: bool,
+    /// シェル実行ファイルのパス。`Config::shell_program` で解決済みのものを渡す。
+    pub program: PathBuf,
     /// 初期 cwd（実パス）。`None` なら `$HOME`。
     pub cwd: Option<PathBuf>,
     pub rows: u16,
@@ -45,10 +47,14 @@ impl PtyManager {
         Self::default()
     }
 
-    /// 指定セッションのシェルを起動する。既存 ID は no-op。
-    pub fn spawn(&mut self, id: &str, spec: SpawnSpec, ctx: &egui::Context) {
+    /// 指定セッションのシェルを起動する。既存 ID は no-op（既存なら true を返す）。
+    ///
+    /// 起動に成功した場合 `true`、失敗した場合 `false` を返す。
+    /// 呼び出し元（`app.rs::apply_pending`）は `false` の場合に
+    /// `state.mark_session_exited` ＋ toast を表示する（08: spawn 失敗検知）。
+    pub fn spawn(&mut self, id: &str, spec: SpawnSpec, ctx: &egui::Context) -> bool {
         if self.handles.contains_key(id) {
-            return;
+            return true;
         }
         match PtySession::spawn(spec, ctx.clone()) {
             Ok(pty) => {
@@ -59,8 +65,12 @@ impl PtyManager {
                         term: SessionTerm::new(),
                     },
                 );
+                true
             }
-            Err(err) => eprintln!("tanaterm: failed to spawn pty for {id}: {err}"),
+            Err(err) => {
+                eprintln!("tanaterm: failed to spawn pty for {id}: {err}");
+                false
+            }
         }
     }
 
@@ -69,9 +79,10 @@ impl PtyManager {
     }
 
     /// 入力行からの送信前に呼ぶ（ブロック取り込み状態の初期化）。
-    pub fn on_submit(&mut self, id: &str) {
+    /// `cmd` は Auto モードのエコー除去用（06: heuristic echo strip）。
+    pub fn on_submit(&mut self, id: &str, cmd: &str) {
         if let Some(h) = self.handles.get_mut(id) {
-            h.term.on_submit();
+            h.term.on_submit(cmd);
         }
     }
 
@@ -126,6 +137,7 @@ impl PtySession {
         let SpawnSpec {
             shell,
             login_shell,
+            program,
             cwd,
             rows,
             cols,
@@ -147,7 +159,7 @@ impl PtySession {
             }
         };
 
-        let mut cmd = CommandBuilder::new(shell.program());
+        let mut cmd = CommandBuilder::new(program);
         let suppress_login = integration.as_ref().is_some_and(|i| i.suppress_login);
         if login_shell && !suppress_login {
             cmd.arg("-l");
@@ -279,6 +291,7 @@ mod tests {
             SpawnSpec {
                 shell: Shell::Zsh,
                 login_shell: true,
+                program: PathBuf::from(Shell::Zsh.program()),
                 cwd: std::env::var_os("HOME").map(PathBuf::from),
                 rows: 24,
                 cols: 80,
@@ -289,7 +302,7 @@ mod tests {
         // シェル初期化（最初のプロンプト）を待ってからコマンドを送る。
         std::thread::sleep(std::time::Duration::from_millis(800));
         let _ = mgr.drain("t1");
-        mgr.on_submit("t1");
+        mgr.on_submit("t1", "echo tanaterm_marker");
         mgr.send("t1", b"echo tanaterm_marker\n");
 
         let mut text = String::new();

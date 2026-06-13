@@ -47,6 +47,10 @@ pub struct Block {
     /// `None` は「実行中」または「heuristic で exit 不明のまま終了」。`running` と併せて判断する。
     pub exit_code: Option<i32>,
     pub output: Vec<OutputSpan>,
+    /// 出力が上限（`MAX_OUTPUT_CHARS`）を超えて先頭が切り詰められた場合 `true`。
+    /// 描画時に「先頭の出力は省略されました」バナーを表示する（19: 出力上限）。
+    #[serde(default)]
+    pub trimmed: bool,
 }
 
 /// ターミナル出力の 1 色スパン。`tanaterm.css` の `.block .out .X` クラスに対応。
@@ -87,6 +91,7 @@ pub struct Session {
     #[serde(default)]
     pub pinned: bool,
     /// ssh 等の remote セッションで "user@host" を入れる。ローカルなら None。
+    /// 現状 UI 表示のみで接続機能は未実装。seed からも外している。
     #[serde(default)]
     pub remote: Option<String>,
     /// `node v22.16.0` のような runtime ラベル（任意）。
@@ -95,6 +100,10 @@ pub struct Session {
     /// このセッションで実行されたコマンドブロック群。新しいほど末尾。
     #[serde(default)]
     pub blocks: Vec<Block>,
+    /// このセッションを起動したシェル。spawn 時に記録し、restart でも同じシェルを使う。
+    /// `serde(default)` で旧バージョンからの移行時は `Shell::default()` が入る。
+    #[serde(default)]
+    pub shell: crate::config::Shell,
     /// OSC 7 で追跡する実 cwd（Tab 補完・表示用）。未取得なら `None`。
     #[serde(skip)]
     pub cwd: Option<std::path::PathBuf>,
@@ -107,6 +116,16 @@ pub struct Session {
     /// 履歴ブラウズ中の位置。`None` = 新規入力中、`Some(i)` = `history[i]` を編集中。
     #[serde(skip)]
     pub history_cursor: Option<usize>,
+    /// alternate screen（vim / less 等）が表示中か（07: alt-screen 検知）。
+    /// `true` の間は `Append` / `OverwriteLine` / `AppendDetached` を無視する。
+    /// `EndBlock` 時に false に戻す（leave シーケンス取りこぼし保険）。
+    #[serde(skip)]
+    pub alt_screen: bool,
+    /// シェルが終了（`exit` / Ctrl+D / spawn 失敗）したか（08: シェル終了検知）。
+    /// `true` の間は入力を受け付けず、restart 導線を表示する。
+    /// `restart_session` で false に戻す。
+    #[serde(skip)]
+    pub shell_exited: bool,
 }
 
 /// Shelf に登録された "お気に入りディレクトリ"。
@@ -174,6 +193,10 @@ pub struct UiState {
     /// 入力行で切り替えるシェル（Phase 2 で実 PTY の起動シェルに反映）。
     #[serde(default)]
     pub shell: crate::config::Shell,
+    /// ターミナル本文のフォントサイズ（pt）。⌘+/− で変更、⌘0 で config 既定にリセット。
+    /// 8.0..=24.0 にクランプ。serde default は 13.0（起動時は Config.font_size で上書き）。
+    #[serde(default = "default_font_size")]
+    pub font_size: f32,
     /// TopBar グローバル検索の入力値。
     #[serde(skip)]
     pub search_query: String,
@@ -200,6 +223,16 @@ pub struct UiState {
     /// 追加フォームを開いた直後の 1 フレームだけ cmd 欄に focus を要求するフラグ。
     #[serde(skip)]
     pub command_add_focus_pending: bool,
+    /// 入力行 TextEdit へのフォーカス要求フラグ（17: 入力行オートフォーカス）。
+    /// 起動直後・セッション切替・新規作成・restart 後に true になり、
+    /// `central.rs::input_line` が `request_focus` を呼んで false に戻す。
+    /// rename 中または command_add_active 中はフラグを保留したまま消化しない。
+    #[serde(skip)]
+    pub focus_input_pending: bool,
+    /// insert_command 後に入力行 TextEdit で選択すべき char 範囲（21: placeholder 選択）。
+    /// `central.rs::input_line` が TextEditState に適用してフラグを下ろす。
+    #[serde(skip)]
+    pub input_select_range: Option<(usize, usize)>,
     /// 表示中の toast（`ctx.input(|i| i.time)` 基準で TTL 経過後に消える）。
     #[serde(skip)]
     pub toast: Option<Toast>,
@@ -212,6 +245,7 @@ impl Default for UiState {
             rail_left_visible: true,
             rail_right_visible: true,
             shell: crate::config::Shell::default(),
+            font_size: default_font_size(),
             search_query: String::new(),
             rename_target: None,
             rename_buffer: String::new(),
@@ -220,6 +254,8 @@ impl Default for UiState {
             command_add_cmd: String::new(),
             command_add_desc: String::new(),
             command_add_focus_pending: false,
+            focus_input_pending: false,
+            input_select_range: None,
             toast: None,
         }
     }
@@ -274,9 +310,12 @@ pub struct PersistentState {
     pub rail_right_visible: bool,
     #[serde(default)]
     pub shell: crate::config::Shell,
+    /// ⌘+/− で変更したフォントサイズ。0.0 は「未保存」として boot 時の Config 値を使う。
+    #[serde(default)]
+    pub font_size: f32,
 }
 
-/// 永続化するセッションの最小情報（name / pwd / pinned）。blocks は復元しない。
+/// 永続化するセッションの最小情報（name / pwd / pinned / shell / history）。blocks は復元しない。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentSession {
     pub id: String,
@@ -284,10 +323,20 @@ pub struct PersistentSession {
     pub pwd: String,
     #[serde(default)]
     pub pinned: bool,
+    /// このセッションを起動したシェル。再起動時に同じシェルを使うために保存する。
+    #[serde(default)]
+    pub shell: crate::config::Shell,
+    /// ↑↓ 履歴（末尾 200 件まで保存）。再起動後も履歴を引き継ぐ（20: 履歴永続化）。
+    #[serde(default)]
+    pub history: Vec<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_font_size() -> f32 {
+    13.0
 }
 
 /// アプリ全体の状態。Phase 1 ではこれを mock で埋めて UI を駆動する。
@@ -371,6 +420,7 @@ impl AppState {
     pub fn boot() -> Self {
         let id = "s1".to_string();
         let pwd = "~/".to_string();
+        let shell = crate::config::Shell::default();
         let session = Session {
             id: id.clone(),
             name: "session".into(),
@@ -380,10 +430,13 @@ impl AppState {
             remote: None,
             node: None,
             blocks: Vec::new(),
+            shell,
             cwd: None,
             input_buffer: String::new(),
             history: Vec::new(),
             history_cursor: None,
+            alt_screen: false,
+            shell_exited: false,
         };
         Self {
             sessions: vec![session],
@@ -391,6 +444,9 @@ impl AppState {
             commands: seed::commands(),
             ui: UiState {
                 active_session_id: Some(id.clone()),
+                shell,
+                // 起動直後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+                focus_input_pending: true,
                 ..UiState::default()
             },
             next_id: default_id_counter(),
@@ -400,15 +456,26 @@ impl AppState {
 
     /// 現在状態から永続化サブセットを抽出する（`eframe::App::save` 用）。
     pub fn to_persistent(&self) -> PersistentState {
+        const MAX_HISTORY: usize = 200;
         PersistentState {
             sessions: self
                 .sessions
                 .iter()
-                .map(|s| PersistentSession {
-                    id: s.id.clone(),
-                    name: s.name.clone(),
-                    pwd: s.pwd.clone(),
-                    pinned: s.pinned,
+                .map(|s| {
+                    // 末尾 200 件に切り詰めて保存する（20: 履歴永続化）。
+                    let history = if s.history.len() <= MAX_HISTORY {
+                        s.history.clone()
+                    } else {
+                        s.history[s.history.len() - MAX_HISTORY..].to_vec()
+                    };
+                    PersistentSession {
+                        id: s.id.clone(),
+                        name: s.name.clone(),
+                        pwd: s.pwd.clone(),
+                        pinned: s.pinned,
+                        shell: s.shell,
+                        history,
+                    }
                 })
                 .collect(),
             active_session_id: self.ui.active_session_id.clone(),
@@ -417,6 +484,7 @@ impl AppState {
             rail_left_visible: self.ui.rail_left_visible,
             rail_right_visible: self.ui.rail_right_visible,
             shell: self.ui.shell,
+            font_size: self.ui.font_size,
         }
     }
 
@@ -426,6 +494,10 @@ impl AppState {
         if p.sessions.is_empty() {
             let mut state = Self::boot();
             state.ui.shell = p.shell;
+            // font_size が 0.0 なら未保存（旧バージョンからの移行）なので default を使う。
+            if p.font_size > 0.0 {
+                state.ui.font_size = p.font_size;
+            }
             return state;
         }
 
@@ -441,10 +513,14 @@ impl AppState {
                 remote: None,
                 node: None,
                 blocks: Vec::new(),
+                shell: ps.shell,
                 cwd: None,
                 input_buffer: String::new(),
-                history: Vec::new(),
+                // 保存済み履歴を復元する（history_cursor は None のまま）（20: 履歴永続化）。
+                history: ps.history.clone(),
                 history_cursor: None,
+                alt_screen: false,
+                shell_exited: false,
             })
             .collect();
 
@@ -479,6 +555,13 @@ impl AppState {
             })
             .collect();
 
+        // font_size が 0.0 なら未保存（旧バージョンからの移行）なので default を使う。
+        let font_size = if p.font_size > 0.0 {
+            p.font_size
+        } else {
+            default_font_size()
+        };
+
         Self {
             sessions,
             shelf: p.shelf,
@@ -488,6 +571,9 @@ impl AppState {
                 rail_left_visible: p.rail_left_visible,
                 rail_right_visible: p.rail_right_visible,
                 shell: p.shell,
+                font_size,
+                // 起動直後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+                focus_input_pending: true,
                 ..UiState::default()
             },
             next_id,
@@ -540,14 +626,18 @@ impl AppState {
         }
         if self.sessions.iter().any(|s| s.id == id) {
             self.ui.active_session_id = Some(id.into());
+            // セッション切替後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+            self.ui.focus_input_pending = true;
         }
     }
 
     /// 新規セッションを末尾に追加して active にし、PTY 起動を `pending` に積む。
     /// `label` は表示名、`pwd` は初期 cwd（shelf クリック時はそのパス、`⌘T` 時は `~/`）。
+    /// 起動シェルは生成時の `ui.shell` を記録する。
     pub fn new_session(&mut self, label: impl Into<String>, pwd: impl Into<String>) -> String {
         let id = self.fresh_id("s");
         let pwd = pwd.into();
+        let shell = self.ui.shell;
         let session = Session {
             id: id.clone(),
             name: label.into(),
@@ -557,13 +647,18 @@ impl AppState {
             remote: None,
             node: None,
             blocks: Vec::new(),
+            shell,
             cwd: None,
             input_buffer: String::new(),
             history: Vec::new(),
             history_cursor: None,
+            alt_screen: false,
+            shell_exited: false,
         };
         self.sessions.push(session);
         self.ui.active_session_id = Some(id.clone());
+        // 新規セッション作成後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+        self.ui.focus_input_pending = true;
         self.pending.push(PendingPty::Spawn {
             id: id.clone(),
             cwd: pwd,
@@ -572,12 +667,15 @@ impl AppState {
     }
 
     /// 指定セッションを閉じる。最後の 1 つは閉じない（仕様メモ "空セッションで起動" に揃える）。
-    pub fn close_session(&mut self, id: &str) {
+    ///
+    /// 実際に閉じた場合は `true`、最後の 1 セッションのため閉じなかった場合は `false` を返す。
+    /// 呼び出し元は `false` の時に「最後のセッションは閉じられません」toast を表示する（10）。
+    pub fn close_session(&mut self, id: &str) -> bool {
         if self.sessions.len() <= 1 {
-            return;
+            return false;
         }
         let Some(pos) = self.sessions.iter().position(|s| s.id == id) else {
-            return;
+            return false;
         };
         self.sessions.remove(pos);
         if self.ui.active_session_id.as_deref() == Some(id) {
@@ -588,13 +686,14 @@ impl AppState {
             self.cancel_rename();
         }
         self.pending.push(PendingPty::Close { id: id.to_string() });
+        true
     }
 
     /// アクティブセッションに生バイト列を `PendingPty::SendRaw` として積む。
     ///
     /// Ctrl+C(0x03) などの制御文字を実行中シェルへ転送する用途。`Send` と違い
     /// `on_submit()`（SGR リセット・出力取り込み開始）は発火しない。
-    /// アクティブセッションがない / `bytes` が空の場合は何もしない。
+    /// アクティブセッションがない / `bytes` が空 / `shell_exited` な場合は何もしない。
     pub fn push_pty_send_raw(&mut self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
@@ -602,6 +701,10 @@ impl AppState {
         let Some(id) = self.ui.active_session_id.clone() else {
             return;
         };
+        // シェル終了済みセッションへの送信は無視する（08: 幽霊 running ブロック防止）。
+        if self.sessions.iter().any(|s| s.id == id && s.shell_exited) {
+            return;
+        }
         self.pending.push(PendingPty::SendRaw { id, bytes });
     }
 
@@ -614,7 +717,12 @@ impl AppState {
     /// 呼び出し元は busy（直近ブロックが `running`）を確認した上で呼ぶ前提。
     /// idle 中に呼ぶと裸の `\n` が PTY に流れて UI と PTY 状態がずれるため、
     /// 公開範囲を crate 内に絞っている。
+    /// シェル終了済みセッションには no-op（08: 幽霊 running ブロック防止）。
     pub(crate) fn submit_input_as_stdin(&mut self) {
+        // shell_exited なら何もしない（08）。
+        if self.active().is_some_and(|s| s.shell_exited) {
+            return;
+        }
         let Some(session) = self.active_mut() else {
             return;
         };
@@ -629,7 +737,12 @@ impl AppState {
     /// 空入力は無視。実行中ブロック（`running` = true, exit 未確定）を作って末尾に積み、
     /// セッションを Busy にし、`"<cmd>\n"` の送信を `pending` に積む。実出力・exit code は
     /// PTY 応答を [`Self::apply_term_action`] が後から流し込む。
+    /// シェル終了済みセッションには no-op（08: 幽霊 running ブロック防止）。
     pub fn submit_input(&mut self, now_hhmm: String) {
+        // shell_exited なら何もしない（08）。
+        if self.active().is_some_and(|s| s.shell_exited) {
+            return;
+        }
         let block_id = self.fresh_id("b");
         let Some(session) = self.active_mut() else {
             return;
@@ -660,6 +773,7 @@ impl AppState {
             running: true,
             exit_code: None,
             output: Vec::new(),
+            trimmed: false,
         });
         session.status = SessionStatus::Busy;
         self.pending.push(PendingPty::Send {
@@ -724,10 +838,23 @@ impl AppState {
     /// PTY 由来の [`crate::term::TermAction`] を該当セッションに適用する。
     pub fn apply_term_action(&mut self, id: &str, action: crate::term::TermAction) {
         use crate::term::TermAction;
+        // alt_screen 中は Append / OverwriteLine / AppendDetached を無視する（07）。
+        let is_alt_screen = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.alt_screen);
         match action {
             TermAction::Append(spans) => {
+                if is_alt_screen {
+                    return;
+                }
                 if let Some(b) = self.running_block_mut(id) {
                     b.output.extend(spans);
+                    // 出力上限を超えていたら先頭を切り詰める（19: 出力上限）。
+                    if trim_output_front(&mut b.output, MAX_OUTPUT_CHARS, KEEP_OUTPUT_CHARS) {
+                        b.trimmed = true;
+                    }
                 }
             }
             TermAction::ClearOutput => {
@@ -736,6 +863,10 @@ impl AppState {
                 }
             }
             TermAction::EndBlock { exit } => {
+                // EndBlock 時は alt_screen を false に戻す（leave 取りこぼし保険）。
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    s.alt_screen = false;
+                }
                 if let Some(b) = self.running_block_mut(id) {
                     b.running = false;
                     b.exit_code = exit;
@@ -749,17 +880,92 @@ impl AppState {
                 }
             }
             TermAction::SetCwd(path) => self.set_session_cwd(id, &path),
+            TermAction::OverwriteLine => {
+                if is_alt_screen {
+                    return;
+                }
+                if let Some(b) = self.running_block_mut(id) {
+                    truncate_after_last_newline(&mut b.output);
+                }
+            }
+            TermAction::AppendDetached(spans) => {
+                if is_alt_screen {
+                    return;
+                }
+                let session = self.sessions.iter_mut().find(|s| s.id == id);
+                let Some(session) = session else { return };
+                let Some(last_block) = session.blocks.last_mut() else {
+                    return; // ブロックが 0 件なら捨てる。
+                };
+                // 末尾ブロックの出力が改行で終わっていなければ先頭に `\n` を補う。
+                let needs_newline = last_block
+                    .output
+                    .last()
+                    .is_some_and(|s| !s.text.ends_with('\n'));
+                if needs_newline {
+                    last_block.output.push(OutputSpan {
+                        color: OutputColor::Dim,
+                        text: "\n".to_string(),
+                    });
+                }
+                last_block.output.extend(spans);
+                // 出力上限を超えていたら先頭を切り詰める（19: 出力上限）。
+                if trim_output_front(&mut last_block.output, MAX_OUTPUT_CHARS, KEEP_OUTPUT_CHARS) {
+                    last_block.trimmed = true;
+                }
+            }
+            TermAction::AltScreen(b) => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    s.alt_screen = b;
+                }
+            }
         }
     }
 
-    /// シェルが終了（チャンネル切断）したセッションを Idle にし、実行中ブロックを閉じる。
+    /// alternate screen が表示中かどうかを返す。`central.rs` のバナー表示に使う。
+    pub fn is_alt_screen(&self, id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.alt_screen)
+    }
+
+    /// シェルが終了（チャンネル切断 / spawn 失敗）したセッションを Idle にし、実行中ブロックを閉じる。
+    ///
+    /// `shell_exited = true` にすることで、入力行の TextEdit を無効化して
+    /// restart 導線に切り替える（08: シェル終了検知）。
     pub fn mark_session_exited(&mut self, id: &str) {
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
             s.status = SessionStatus::Idle;
+            s.shell_exited = true;
             for b in s.blocks.iter_mut() {
                 b.running = false;
             }
         }
+    }
+
+    /// 終了したシェルを再起動する（08: restart 導線）。
+    ///
+    /// `shell_exited` を false に戻し、status を Live にして
+    /// `PendingPty::Spawn` を積む。PTY ハンドルは exited 時に close 済みなので
+    /// `PtyManager::spawn` が新規起動する。
+    pub fn restart_session(&mut self, id: &str) {
+        let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        s.shell_exited = false;
+        s.status = SessionStatus::Live;
+        let cwd = s
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.pwd.clone());
+        // restart 後に入力欄へフォーカスを当てる（17: 入力行オートフォーカス）。
+        self.ui.focus_input_pending = true;
+        self.pending.push(PendingPty::Spawn {
+            id: id.to_string(),
+            cwd,
+        });
     }
 
     /// OSC 7 で得た実 cwd をセッションに反映する。表示 pwd は `$HOME` を `~` に畳む。
@@ -830,10 +1036,17 @@ impl AppState {
             return;
         };
 
+        // シェルの慣例に合わせ、prefix が '.' で始まる場合のみ dotfile（'.'' 始まり）を候補に含める。
+        // それ以外では '.' 始まりのエントリを除外して補完候補が汚れるのを防ぐ（16: dotfile 除外）。
+        let include_dotfiles = prefix.starts_with('.');
         let mut matches: Vec<(String, bool)> = entries
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
+                // dotfile の除外判定: prefix が '.' で始まらない場合、'.' 始まりのエントリを除外。
+                if !include_dotfiles && name.starts_with('.') {
+                    return None;
+                }
                 if name.starts_with(prefix) {
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     Some((name, is_dir))
@@ -870,6 +1083,8 @@ impl AppState {
 
     /// 右 rail のコマンドをアクティブセッションの input_buffer に挿入する。
     /// 既存入力があっても上書きする（仕様: "insert" 挙動）。
+    /// placeholder（`$識別子`）があれば最初の範囲を `input_select_range` にセットし、
+    /// `focus_input_pending` を立てる（21: placeholder 選択）。
     pub fn insert_command(&mut self, cmd_id: &str, now: f64) {
         let Some(text) = self
             .commands
@@ -883,6 +1098,13 @@ impl AppState {
             session.input_buffer = text.clone();
             session.history_cursor = None;
         }
+        // placeholder があれば選択範囲をセットして入力行にフォーカスする（21）。
+        if let Some(range) = first_placeholder_range(&text) {
+            self.ui.input_select_range = Some(range);
+        } else {
+            self.ui.input_select_range = None;
+        }
+        self.ui.focus_input_pending = true;
         self.show_toast(format!("Inserted {text}"), None, now);
     }
 
@@ -1016,6 +1238,17 @@ impl AppState {
         self.ui.rename_focus_pending = false;
     }
 
+    /// ターミナルフォントサイズを 8.0..=24.0 にクランプして設定する。
+    pub fn set_font_size(&mut self, size: f32) {
+        self.ui.font_size = size.clamp(8.0, 24.0);
+    }
+
+    /// 現在のフォントサイズに `delta` を加算して [`Self::set_font_size`] へ渡す。
+    pub fn adjust_font_size(&mut self, delta: f32) {
+        let new = self.ui.font_size + delta;
+        self.set_font_size(new);
+    }
+
     /// Toast を 1 つ表示する。すでに表示中の Toast は置き換える。
     pub fn show_toast(&mut self, label: impl Into<String>, detail: Option<String>, now: f64) {
         self.ui.toast = Some(Toast::new(label, detail, now));
@@ -1065,6 +1298,212 @@ impl AppState {
     }
 }
 
+/// 文字列中の最初の `$識別子`（'$' + [A-Za-z_][A-Za-z0-9_]*）の char 範囲
+/// （開始 char index, 終了 char index = 排他的）を返す。無ければ None。
+///
+/// `$1` のような数字始まりや `$` 単独は対象外。regex は使わず手書きスキャン（21: placeholder 選択）。
+pub fn first_placeholder_range(s: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '$' {
+            // '$' の次の文字が識別子先頭（[A-Za-z_]）かチェックする。
+            let j = i + 1;
+            if j < n && (chars[j].is_ascii_alphabetic() || chars[j] == '_') {
+                // 識別子末尾を探す。
+                let mut k = j + 1;
+                while k < n && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                return Some((i, k));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// クエリの空白区切り各語が、いずれかのフィールドに（小文字化した）部分一致するか。
+///
+/// - 空クエリは常に `true`。
+/// - 全ての語がどこかのフィールドにヒットした時のみ `true`（AND 検索）。
+/// - 大文字小文字は無視（ASCII 範囲で小文字化して比較）。
+pub fn matches_query(query: &str, fields: &[&str]) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    // フィールドを一度だけ小文字化してキャッシュする。
+    let lowered: Vec<String> = fields.iter().map(|f| f.to_lowercase()).collect();
+    // 空白区切りの各語がいずれかのフィールドに含まれるか（AND）。
+    q.split_whitespace().all(|word| {
+        let w = word.to_lowercase();
+        lowered.iter().any(|f| f.contains(w.as_str()))
+    })
+}
+
+/// 出力上限（19: 出力上限・メモリ保護）。
+///
+/// `output` の総文字数がこの値を超えたら `trim_output_front` で先頭を削る。
+const MAX_OUTPUT_CHARS: usize = 400_000;
+
+/// `trim_output_front` で切り詰めた後に残す目標文字数。
+const KEEP_OUTPUT_CHARS: usize = 300_000;
+
+/// output の総文字数が `max_chars` を超えていたら、先頭の span から削って
+/// `keep_chars` 程度まで縮める。切り口は行境界（`'\n'` の直後）に揃える。
+/// 削った場合 `true` を返す。
+///
+/// ## アルゴリズム
+/// 1. `chars_to_drop = total - keep_chars` 文字分を先頭から削る位置を決める。
+/// 2. その位置までの文字列（削り対象）の中で**最後の** `'\n'` を探す。
+///    - 見つかれば、その `'\n'` の直後を切り口にする（削り量を最小化して行境界に揃える）。
+///    - 見つからなければ `chars_to_drop` 文字目より後の最初の `'\n'` の直後を切り口にする。
+/// 3. 切り口以前を全て削除する。
+pub(crate) fn trim_output_front(
+    output: &mut Vec<OutputSpan>,
+    max_chars: usize,
+    keep_chars: usize,
+) -> bool {
+    // 総文字数を算出する。
+    let total: usize = output.iter().map(|s| s.text.chars().count()).sum();
+    if total <= max_chars {
+        return false;
+    }
+
+    // 先頭から削る文字数（バイト数ではなく文字数で管理し、その後で行境界に揃える）。
+    let chars_to_drop = total.saturating_sub(keep_chars);
+
+    // 削り対象（先頭 chars_to_drop 文字）の全文字列を結合して rfind('\n') で
+    // 最後の行境界を探す。見つかれば、その直後を切り口にする（削り量最小化）。
+    // 見つからなければ chars_to_drop 以降で最初の '\n' 直後を探す。
+    //
+    // 切り口 = output の先頭から数えた「文字インデックス」で表す。
+    let cut_char_idx: usize;
+
+    // 削り対象の文字列を結合する（chars_to_drop 文字分）。
+    let mut prefix_str = String::with_capacity(chars_to_drop);
+    let mut collected = 0usize;
+    for span in output.iter() {
+        if collected >= chars_to_drop {
+            break;
+        }
+        let need = chars_to_drop - collected;
+        let span_chars = span.text.chars().count();
+        if span_chars <= need {
+            prefix_str.push_str(&span.text);
+            collected += span_chars;
+        } else {
+            // span の途中まで。
+            let partial: String = span.text.chars().take(need).collect();
+            prefix_str.push_str(&partial);
+            collected += need;
+        }
+    }
+
+    if let Some(nl_byte_pos) = prefix_str.rfind('\n') {
+        // 削り対象内の最後の '\n' の直後を切り口にする（削り量最小化）。
+        // nl_byte_pos はバイト位置 → 文字インデックスに変換する。
+        cut_char_idx = prefix_str[..nl_byte_pos + 1].chars().count();
+    } else {
+        // 削り対象内に '\n' が無い → chars_to_drop 以降で最初の '\n' を探す。
+        // 全 span の chars_to_drop 文字目以降を走査する。
+        let mut idx = 0usize;
+        let mut found = None;
+        'forward: for span in output.iter() {
+            let span_chars = span.text.chars().count();
+            let span_start = idx;
+            let span_end = idx + span_chars;
+            if span_end <= chars_to_drop {
+                // この span は丸ごと削り対象内。
+                idx = span_end;
+                continue;
+            }
+            // chars_to_drop の境界がこの span 内にある（または span 全体が境界以降）。
+            let offset_in_span = chars_to_drop.saturating_sub(span_start);
+            // この span の offset_in_span 文字目以降で '\n' を探す。
+            let after: String = span.text.chars().skip(offset_in_span).collect();
+            if let Some(nl_pos) = after.find('\n') {
+                // nl_pos はバイト位置。文字数に変換する。
+                let nl_char_count = after[..nl_pos + 1].chars().count();
+                found = Some(span_start + offset_in_span + nl_char_count);
+                break 'forward;
+            }
+            idx = span_end;
+        }
+        match found {
+            Some(c) => cut_char_idx = c,
+            None => {
+                // '\n' が全く無い（改行なしの巨大な単一行）→ 行境界に揃えられないため
+                // chars_to_drop 位置で行中カットする。全消去すると keep 分まで失われる。
+                cut_char_idx = chars_to_drop;
+            }
+        }
+    }
+
+    if cut_char_idx == 0 {
+        // 切り口が先頭 → 実質何も削らない（行境界が先頭にある場合）。
+        // ただし max_chars を超えているのに 0 にはなりにくいが防衛的に処理する。
+        return true;
+    }
+
+    // cut_char_idx 文字目より前を全て削除する。
+    // span を先頭から走査して cut_char_idx に達するまで削る。
+    let mut remaining_cut = cut_char_idx;
+    loop {
+        if output.is_empty() {
+            break;
+        }
+        let span_chars = output[0].text.chars().count();
+        if span_chars <= remaining_cut {
+            // この span を丸ごと削除する。
+            output.remove(0);
+            remaining_cut -= span_chars;
+        } else {
+            // この span の途中まで削る。
+            let byte_offset: usize = output[0]
+                .text
+                .char_indices()
+                .nth(remaining_cut)
+                .map(|(b, _)| b)
+                .unwrap_or(output[0].text.len());
+            output[0].text = output[0].text[byte_offset..].to_string();
+            break;
+        }
+    }
+
+    // 空 span を除去する。
+    output.retain(|s| !s.text.is_empty());
+
+    true
+}
+
+/// `\r` 上書き（プログレスバー）用: ブロック出力の最終行（最後の `'\n'` より後ろ）を削る。
+///
+/// - span を末尾から走査し、`'\n'` を含む span を見つけたらその span 内の
+///   最後の `'\n'` 直後まで残して切り詰める。
+/// - `'\n'` が見つからないまま先頭に達したら output 全体をクリアする。
+/// - 空になった span は除去する。
+pub(crate) fn truncate_after_last_newline(output: &mut Vec<OutputSpan>) {
+    // 末尾から \n を探す。
+    let len = output.len();
+    for i in (0..len).rev() {
+        if let Some(pos) = output[i].text.rfind('\n') {
+            // この span の最後の \n 直後まで残す。
+            output[i].text.truncate(pos + 1);
+            // それより後ろの span を全て削除する。
+            output.truncate(i + 1);
+            // text が空になった span（\n だけなら空にならないが念のため）を除去する。
+            // ただし \n を含む場合はその span は残す（text = "\n" は空でない）。
+            output.retain(|s| !s.text.is_empty());
+            return;
+        }
+    }
+    // \n が見つからない → output 全体をクリア（最初の行だけで上書きが始まるケース）。
+    output.clear();
+}
+
 /// `tanaterm-data.jsx` の INITIAL_* に対応する seed データ。
 mod seed {
     #[cfg(test)]
@@ -1108,6 +1547,7 @@ mod seed {
                             span(OutputColor::Dim, "   8 tanaka  staff   256 May 21 14:00 "),
                             span(OutputColor::Default, "src\n"),
                         ],
+                        trimmed: false,
                     },
                     Block {
                         id: "b2".into(),
@@ -1125,6 +1565,7 @@ mod seed {
                             span(OutputColor::Sage, "✓ "),
                             span(OutputColor::Default, "0 errors  · 3.42s\n"),
                         ],
+                        trimmed: false,
                     },
                     Block {
                         id: "b3".into(),
@@ -1145,12 +1586,16 @@ mod seed {
                             span(OutputColor::Sage, "  ➜  "),
                             span(OutputColor::Default, "Network: use --host to expose\n"),
                         ],
+                        trimmed: false,
                     },
                 ],
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: vec!["ls -la".into(), "pnpm typecheck".into(), "pnpm dev".into()],
                 history_cursor: None,
+                alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s2".into(),
@@ -1169,11 +1614,15 @@ mod seed {
                     running: true,
                     exit_code: None,
                     output: vec![span(OutputColor::Dim, "Streaming logs…")],
+                    trimmed: false,
                 }],
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: vec!["docker compose logs -f api".into()],
                 history_cursor: None,
+                alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s3".into(),
@@ -1184,10 +1633,13 @@ mod seed {
                 remote: None,
                 node: None,
                 blocks: Vec::new(),
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: Vec::new(),
                 history_cursor: None,
+                alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s4".into(),
@@ -1198,10 +1650,13 @@ mod seed {
                 remote: Some("tanaka@prod-01".into()),
                 node: None,
                 blocks: Vec::new(),
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: Vec::new(),
                 history_cursor: None,
+                alt_screen: false,
+                shell_exited: false,
             },
             Session {
                 id: "s5".into(),
@@ -1212,10 +1667,13 @@ mod seed {
                 remote: None,
                 node: None,
                 blocks: Vec::new(),
+                shell: crate::config::Shell::default(),
                 cwd: None,
                 input_buffer: String::new(),
                 history: Vec::new(),
                 history_cursor: None,
+                alt_screen: false,
+                shell_exited: false,
             },
         ]
     }
@@ -1235,7 +1693,9 @@ mod seed {
             shelf_item("f4", "dotfiles", "~/.config", "personal", None, 60),
             shelf_item("f5", "notes", "~/notes", "personal", None, 21),
             shelf_item("f6", "downloads", "~/Downloads", "personal", None, 7),
-            shelf_item("f7", "prod logs", "/var/log", "remote", Some("prod-01"), 12),
+            // f7 (prod logs, /var/log, remote: prod-01) は削除済み。
+            // remote 接続は未実装のため、クリック時にローカルで /var/log を開くだけになり
+            // UI に "prod-01:" と表示されて誤解を招くため seed から外した（指示書14）。
             shelf_item("f8", "sandbox", "~/tmp/sandbox", "work", None, 3),
         ]
     }
@@ -1303,13 +1763,18 @@ mod tests {
     fn close_session_refuses_to_remove_last_one() {
         let mut s = fresh();
         let ids: Vec<String> = s.sessions.iter().map(|x| x.id.clone()).collect();
-        // 最後の 1 つになるまで閉じる
+        // 最後の 1 つになるまで閉じる（それ以外は true を返す）。
         for id in &ids[..ids.len() - 1] {
-            s.close_session(id);
+            assert!(
+                s.close_session(id),
+                "最後以外の close_session は true を返す"
+            );
         }
         assert_eq!(s.sessions.len(), 1, "下準備として 1 セッションになるはず");
         let last_id = s.sessions[0].id.clone();
-        s.close_session(&last_id);
+        // 最後の 1 セッションは閉じない → false を返す（10: 戻り値の assert）。
+        let result = s.close_session(&last_id);
+        assert!(!result, "最後の 1 つを閉じようとすると false が返る");
         assert_eq!(s.sessions.len(), 1, "最後の 1 つは閉じられない");
         assert_eq!(s.ui.active_session_id.as_deref(), Some(last_id.as_str()));
     }
@@ -1319,7 +1784,8 @@ mod tests {
         let mut s = fresh();
         // active を s2 にして s2 を閉じると、削除位置にある旧 s3 がアクティブになる。
         s.focus_session("s2");
-        s.close_session("s2");
+        let result = s.close_session("s2");
+        assert!(result, "s2 を閉じると true を返す");
         assert_eq!(s.ui.active_session_id.as_deref(), Some("s3"));
     }
 
@@ -1801,6 +2267,8 @@ mod tests {
                 name: "old".into(),
                 pwd: "~/".into(),
                 pinned: false,
+                shell: crate::config::Shell::default(),
+                history: Vec::new(),
             }],
             ..Default::default()
         };
@@ -1820,5 +2288,745 @@ mod tests {
         assert_eq!(s.shelf.len(), before + 1);
         assert_eq!(s.shelf.last().unwrap().label, "tanaterm");
         assert_eq!(s.shelf.last().unwrap().path, "~/work/tanaterm");
+    }
+
+    // ── 04: truncate_after_last_newline テスト ─────────────────────────────────
+
+    /// 複数 span に \n が含まれる場合、最後の \n 直後まで残してそれ以降を削る。
+    #[test]
+    fn truncate_after_last_newline_multi_span() {
+        use crate::state::truncate_after_last_newline;
+        let mut output = vec![
+            OutputSpan {
+                color: OutputColor::Default,
+                text: "x\n".to_string(),
+            },
+            OutputSpan {
+                color: OutputColor::Default,
+                text: "y".to_string(),
+            },
+        ];
+        truncate_after_last_newline(&mut output);
+        // "x\n" までが残り "y" は削除される。
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].text, "x\n");
+    }
+
+    /// 単一 span で \n なし → output 全体クリア。
+    #[test]
+    fn truncate_after_last_newline_no_newline_clears() {
+        use crate::state::truncate_after_last_newline;
+        let mut output = vec![OutputSpan {
+            color: OutputColor::Default,
+            text: "abc".to_string(),
+        }];
+        truncate_after_last_newline(&mut output);
+        assert!(output.is_empty(), "\\n なし → output クリア");
+    }
+
+    /// span 内の最後の \n 直後で切り詰める（span 途中の \n）。
+    #[test]
+    fn truncate_after_last_newline_cuts_within_span() {
+        use crate::state::truncate_after_last_newline;
+        let mut output = vec![OutputSpan {
+            color: OutputColor::Default,
+            text: "line1\nline2".to_string(),
+        }];
+        truncate_after_last_newline(&mut output);
+        // "line1\n" まで残る。
+        assert_eq!(output[0].text, "line1\n");
+    }
+
+    // ── 04: OverwriteLine state テスト ────────────────────────────────────────
+
+    /// 実行中ブロック出力が "x\ny" で OverwriteLine → "x\n" になる。
+    #[test]
+    fn apply_term_action_overwrite_line() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "echo".into();
+        }
+        s.submit_input("12:00".into());
+        s.apply_term_action(
+            "s3",
+            TermAction::Append(vec![
+                OutputSpan {
+                    color: OutputColor::Default,
+                    text: "x\n".into(),
+                },
+                OutputSpan {
+                    color: OutputColor::Default,
+                    text: "y".into(),
+                },
+            ]),
+        );
+        s.apply_term_action("s3", TermAction::OverwriteLine);
+        let block = s.active().unwrap().blocks.last().unwrap();
+        let text: String = block.output.iter().map(|sp| sp.text.as_str()).collect();
+        assert_eq!(text, "x\n", "OverwriteLine 後は 'x\\n' のみ残る");
+    }
+
+    // ── 05: AppendDetached state テスト ───────────────────────────────────────
+
+    /// ブロックが存在する時に AppendDetached が最終ブロックへ Dim で追記される。
+    #[test]
+    fn apply_term_action_append_detached_to_last_block() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "sleep 5 &".into();
+        }
+        s.submit_input("12:00".into());
+        // ブロックを完了状態にする。
+        s.apply_term_action("s3", TermAction::EndBlock { exit: Some(0) });
+        // AppendDetached を適用する。
+        s.apply_term_action(
+            "s3",
+            TermAction::AppendDetached(vec![OutputSpan {
+                color: OutputColor::Dim,
+                text: "[1]  + done sleep 5\n".into(),
+            }]),
+        );
+        let block = s.active().unwrap().blocks.last().unwrap();
+        let text: String = block.output.iter().map(|sp| sp.text.as_str()).collect();
+        assert!(
+            text.contains("[1]  + done sleep 5"),
+            "AppendDetached が最終ブロックへ追記される: {text:?}",
+        );
+        // Dim 色であること。
+        assert!(
+            block
+                .output
+                .last()
+                .is_some_and(|sp| sp.color == OutputColor::Dim),
+            "AppendDetached は Dim 色: {:?}",
+            block.output.last(),
+        );
+    }
+
+    /// ブロック 0 件では AppendDetached が何もしない。
+    #[test]
+    fn apply_term_action_append_detached_no_blocks_noop() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3"); // s3 は blocks: Vec::new()
+        let block_count = s.active().unwrap().blocks.len();
+        s.apply_term_action(
+            "s3",
+            TermAction::AppendDetached(vec![OutputSpan {
+                color: OutputColor::Dim,
+                text: "orphan\n".into(),
+            }]),
+        );
+        assert_eq!(
+            s.active().unwrap().blocks.len(),
+            block_count,
+            "ブロック 0 件では何も起きない",
+        );
+    }
+
+    // ── 08: shell_exited / restart_session テスト ─────────────────────────────
+
+    /// `mark_session_exited` 後の `submit_input` は no-op（幽霊 running ブロック防止）。
+    #[test]
+    fn submit_input_is_noop_after_shell_exited() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        let blocks_before = s.active().unwrap().blocks.len();
+        s.pending.clear();
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "ls".into();
+        }
+        s.submit_input("12:00".into());
+        assert_eq!(
+            s.active().unwrap().blocks.len(),
+            blocks_before,
+            "shell_exited 中は新規ブロックを積まない"
+        );
+        assert!(s.pending.is_empty(), "shell_exited 中は pending も積まない");
+    }
+
+    /// `mark_session_exited` 後の `submit_input_as_stdin` は no-op。
+    #[test]
+    fn submit_input_as_stdin_is_noop_after_shell_exited() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        s.pending.clear();
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "y".into();
+        }
+        s.submit_input_as_stdin();
+        assert!(s.pending.is_empty(), "shell_exited 中は SendRaw も積まない");
+    }
+
+    /// `mark_session_exited` 後の `push_pty_send_raw` は no-op。
+    #[test]
+    fn push_pty_send_raw_is_noop_after_shell_exited() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        s.pending.clear();
+        s.push_pty_send_raw(vec![0x03]);
+        assert!(s.pending.is_empty(), "shell_exited 中は SendRaw も積まない");
+    }
+
+    /// `restart_session` で `shell_exited` が false に戻り、`PendingPty::Spawn` が積まれ、
+    /// status が Live になること。
+    #[test]
+    fn restart_session_resets_state_and_queues_spawn() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        s.mark_session_exited("s3");
+        assert!(s.active().unwrap().shell_exited, "終了済み状態になっている");
+        assert_eq!(s.active().unwrap().status, SessionStatus::Idle);
+        s.pending.clear();
+        s.restart_session("s3");
+        assert!(
+            !s.active().unwrap().shell_exited,
+            "restart で shell_exited が false に戻る"
+        );
+        assert_eq!(
+            s.active().unwrap().status,
+            SessionStatus::Live,
+            "restart で status が Live になる"
+        );
+        assert_eq!(s.pending.len(), 1, "Spawn が 1 件積まれる");
+        assert!(
+            matches!(s.pending[0], PendingPty::Spawn { ref id, .. } if id == "s3"),
+            "積まれる PendingPty は Spawn"
+        );
+    }
+
+    // ── 07: AltScreen state テスト ────────────────────────────────────────────
+
+    /// AltScreen(true) 中の Append が無視される。
+    #[test]
+    fn apply_term_action_alt_screen_suppresses_append() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "vim".into();
+        }
+        s.submit_input("12:00".into());
+        // AltScreen に入る。
+        s.apply_term_action("s3", TermAction::AltScreen(true));
+        // この Append は無視されるはず。
+        s.apply_term_action(
+            "s3",
+            TermAction::Append(vec![OutputSpan {
+                color: OutputColor::Default,
+                text: "vim output".into(),
+            }]),
+        );
+        let block = s.active().unwrap().blocks.last().unwrap();
+        assert!(
+            block.output.is_empty(),
+            "AltScreen 中は Append が無視される"
+        );
+
+        // AltScreen(false) で解除後は Append が届く。
+        s.apply_term_action("s3", TermAction::AltScreen(false));
+        s.apply_term_action(
+            "s3",
+            TermAction::Append(vec![OutputSpan {
+                color: OutputColor::Default,
+                text: "after vim".into(),
+            }]),
+        );
+        let block = s.active().unwrap().blocks.last().unwrap();
+        let text: String = block.output.iter().map(|sp| sp.text.as_str()).collect();
+        assert_eq!(text, "after vim", "AltScreen 解除後は Append が届く");
+    }
+
+    /// EndBlock で alt_screen が false に戻る。
+    #[test]
+    fn apply_term_action_end_block_resets_alt_screen() {
+        use crate::term::TermAction;
+        let mut s = fresh();
+        s.focus_session("s3");
+        if let Some(sess) = s.active_mut() {
+            sess.input_buffer = "vim".into();
+        }
+        s.submit_input("12:00".into());
+        s.apply_term_action("s3", TermAction::AltScreen(true));
+        assert!(
+            s.active().unwrap().alt_screen,
+            "AltScreen true にセットされる"
+        );
+        s.apply_term_action("s3", TermAction::EndBlock { exit: Some(0) });
+        assert!(
+            !s.active().unwrap().alt_screen,
+            "EndBlock で alt_screen が false に戻る"
+        );
+    }
+
+    // ── 11: font_size クランプ / adjust テスト ───────────────────────────────
+
+    /// 下限（7.0 → 8.0）と上限（30.0 → 24.0）のクランプ。
+    #[test]
+    fn set_font_size_clamps_to_range() {
+        let mut s = fresh();
+        s.set_font_size(7.0);
+        assert_eq!(s.ui.font_size, 8.0, "下限 7.0 は 8.0 にクランプされる");
+        s.set_font_size(30.0);
+        assert_eq!(s.ui.font_size, 24.0, "上限 30.0 は 24.0 にクランプされる");
+    }
+
+    /// adjust_font_size: 加算・減算がクランプ込みで動く。
+    #[test]
+    fn adjust_font_size_adds_and_clamps() {
+        let mut s = fresh();
+        s.set_font_size(13.0);
+        s.adjust_font_size(1.0);
+        assert_eq!(s.ui.font_size, 14.0, "+1.0 → 14.0");
+        s.adjust_font_size(-3.0);
+        assert_eq!(s.ui.font_size, 11.0, "-3.0 → 11.0");
+        // 上限超え
+        s.set_font_size(23.0);
+        s.adjust_font_size(5.0);
+        assert_eq!(s.ui.font_size, 24.0, "上限超えはクランプ");
+    }
+
+    /// PersistentState 往復で font_size が保存・復元される。
+    #[test]
+    fn persistent_roundtrip_preserves_font_size() {
+        let mut s = fresh();
+        s.set_font_size(16.0);
+        let p = s.to_persistent();
+        assert_eq!(p.font_size, 16.0, "to_persistent に font_size が含まれる");
+        let restored = AppState::from_persistent(p);
+        assert_eq!(
+            restored.ui.font_size, 16.0,
+            "from_persistent で font_size が復元される"
+        );
+    }
+
+    // ── 13: Session.shell 記録テスト ─────────────────────────────────────────
+
+    /// `new_session` が呼び出し時の `ui.shell` をセッションに記録すること。
+    #[test]
+    fn new_session_records_current_ui_shell() {
+        let mut s = fresh();
+        // bash に切り替えてからセッションを作る。
+        s.ui.shell = crate::config::Shell::Bash;
+        let id = s.new_session("test", "~/");
+        let session = s.sessions.iter().find(|x| x.id == id).unwrap();
+        assert_eq!(
+            session.shell,
+            crate::config::Shell::Bash,
+            "new_session は作成時の ui.shell を記録する"
+        );
+    }
+
+    /// PersistentState 往復で各セッションの `shell` が保存・復元されること。
+    #[test]
+    fn persistent_roundtrip_preserves_session_shell() {
+        let mut s = fresh();
+        // s1 は Zsh（デフォルト）、s2 は Bash に設定する。
+        s.sessions.iter_mut().find(|x| x.id == "s1").unwrap().shell = crate::config::Shell::Zsh;
+        s.sessions.iter_mut().find(|x| x.id == "s2").unwrap().shell = crate::config::Shell::Bash;
+
+        let restored = AppState::from_persistent(s.to_persistent());
+
+        let r1 = restored.sessions.iter().find(|x| x.id == "s1").unwrap();
+        assert_eq!(
+            r1.shell,
+            crate::config::Shell::Zsh,
+            "s1 は Zsh で復元される"
+        );
+        let r2 = restored.sessions.iter().find(|x| x.id == "s2").unwrap();
+        assert_eq!(
+            r2.shell,
+            crate::config::Shell::Bash,
+            "s2 は Bash で復元される"
+        );
+    }
+
+    // ── 16: Tab 補完 dotfile 除外テスト ─────────────────────────────────────
+
+    /// prefix が空（空白区切りトークン終わり）の場合、.hidden は除外され visible.txt が補完される。
+    #[test]
+    fn tab_complete_excludes_dotfiles_when_prefix_is_not_dot() {
+        use std::fs;
+
+        // 一意のテスト用ディレクトリを作成する。
+        let dir = std::env::temp_dir().join(format!(
+            "tanaterm_test_dotfile_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".hidden"), "").unwrap();
+        fs::write(dir.join("visible.txt"), "").unwrap();
+
+        let mut s = fresh();
+        // セッションの cwd をテストディレクトリに向ける。
+        if let Some(sess) = s.active_mut() {
+            sess.cwd = Some(dir.clone());
+            // prefix 空（"cat " の末尾トークンが空）の場合。
+            sess.input_buffer = "cat ".to_string();
+        }
+        s.tab_complete();
+        let buf = s.active().unwrap().input_buffer.clone();
+        assert!(
+            buf.contains("visible.txt"),
+            "prefix 空では visible.txt が補完される: {buf:?}"
+        );
+        assert!(
+            !buf.contains(".hidden"),
+            "prefix 空では .hidden に引っ張られない: {buf:?}"
+        );
+
+        // テスト用ディレクトリを削除。
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// prefix が '.' で始まる場合、.hidden が候補に含まれて補完される。
+    #[test]
+    fn tab_complete_includes_dotfiles_when_prefix_starts_with_dot() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tanaterm_test_dotfile2_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".hidden"), "").unwrap();
+        fs::write(dir.join("visible.txt"), "").unwrap();
+
+        let mut s = fresh();
+        if let Some(sess) = s.active_mut() {
+            sess.cwd = Some(dir.clone());
+            // prefix が "." の場合。
+            sess.input_buffer = "cat .".to_string();
+        }
+        s.tab_complete();
+        let buf = s.active().unwrap().input_buffer.clone();
+        assert!(
+            buf.contains(".hidden"),
+            "prefix '.' では .hidden が補完される: {buf:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 17: focus_input_pending テスト ────────────────────────────────────
+
+    /// `focus_session` でフラグが立つこと。
+    #[test]
+    fn focus_session_sets_focus_input_pending() {
+        let mut s = fresh();
+        s.ui.focus_input_pending = false;
+        s.focus_session("s2");
+        assert!(s.ui.focus_input_pending, "focus_session でフラグが立つ");
+    }
+
+    /// `new_session` でフラグが立つこと。
+    #[test]
+    fn new_session_sets_focus_input_pending() {
+        let mut s = fresh();
+        s.ui.focus_input_pending = false;
+        s.new_session("test", "~/");
+        assert!(s.ui.focus_input_pending, "new_session でフラグが立つ");
+    }
+
+    /// `boot` でフラグが立つこと。
+    #[test]
+    fn boot_sets_focus_input_pending() {
+        let s = AppState::boot();
+        assert!(s.ui.focus_input_pending, "boot でフラグが立つ");
+    }
+
+    // ── 19: trim_output_front テスト ─────────────────────────────────────────
+
+    fn make_span(text: &str) -> OutputSpan {
+        OutputSpan {
+            color: OutputColor::Default,
+            text: text.to_string(),
+        }
+    }
+
+    /// 総文字数が上限以下なら何もしない（false を返す）。
+    #[test]
+    fn trim_output_front_no_op_when_under_limit() {
+        let mut output = vec![make_span("hello\nworld\n")];
+        let result = trim_output_front(&mut output, 400_000, 300_000);
+        assert!(!result, "上限未満では false を返す");
+        assert_eq!(output.len(), 1, "内容は変わらない");
+        assert_eq!(output[0].text, "hello\nworld\n");
+    }
+
+    /// 上限超過時に先頭が削れ、keep_chars 以下になること。
+    #[test]
+    fn trim_output_front_trims_when_over_limit() {
+        // 小さな上限で動作確認する。
+        // 20 文字超えたら 10 文字に縮める設定。
+        let text_a = "aaaa\nbbbb\n"; // 10 文字
+        let text_b = "cccc\ndddd\n"; // 10 文字
+        let text_c = "eeee\nffff\n"; // 10 文字（合計 30 文字 > max 20）
+        let mut output = vec![make_span(text_a), make_span(text_b), make_span(text_c)];
+        let result = trim_output_front(&mut output, 20, 10);
+        assert!(result, "上限超過では true を返す");
+        // 残った文字数が keep_chars 以下に縮んでいること。
+        let remaining: usize = output.iter().map(|s| s.text.chars().count()).sum();
+        assert!(
+            remaining <= 20,
+            "切り詰め後の文字数 {remaining} は max 以下のはず"
+        );
+    }
+
+    /// 切り口が行頭（直前が '\n'）に揃うこと。
+    #[test]
+    fn trim_output_front_aligns_to_line_boundary() {
+        // max=5, keep=3 → 先頭 2 文字を削りたいが、行境界に揃える。
+        // "ab\ncd\nef" (9 chars) を max=7, keep=5 で → 先頭 2 char 削って行境界へ。
+        // 最初の '\n' は 2 文字目なので、切り口は 3 文字目（'c' の前、'\n' の直後）になる。
+        let mut output = vec![make_span("ab\ncd\nef")];
+        let result = trim_output_front(&mut output, 7, 5);
+        assert!(result, "true を返す");
+        let text: String = output.iter().map(|s| s.text.as_str()).collect();
+        // 切り口は '\n' の直後 → "cd\nef" が残るはず。
+        assert!(
+            text.starts_with("cd\n") || text == "cd\nef",
+            "行境界で切れる: {text:?}"
+        );
+        // 先頭は '\n' の直後（行頭）であること: 直前文字は無いか '\n'。
+        assert!(
+            !text.starts_with('\n'),
+            "先頭に余分な改行が残らない: {text:?}"
+        );
+    }
+
+    /// 削った場合の戻り値が true。
+    #[test]
+    fn trim_output_front_returns_true_when_trimmed() {
+        let big = "x".repeat(10);
+        let mut output: Vec<OutputSpan> = (0..5).map(|_| make_span(&big)).collect();
+        // 40 文字 > max=20, keep=10 。
+        let result = trim_output_front(&mut output, 20, 10);
+        assert!(result, "削った場合は true");
+    }
+
+    /// 改行が一切無い巨大な単一行でも全消去せず、末尾 keep_chars 分が残ること。
+    #[test]
+    fn trim_output_front_single_line_without_newline_keeps_tail() {
+        // 50 文字・改行なし。max=30, keep=20 → 先頭 30 文字を行中カットで削る。
+        let text: String = ('a'..='z').cycle().take(50).collect();
+        let mut output = vec![make_span(&text)];
+        let result = trim_output_front(&mut output, 30, 20);
+        assert!(result, "削った場合は true");
+        let remaining: String = output.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            remaining,
+            text.chars().skip(30).collect::<String>(),
+            "末尾 20 文字が残る（全消去しない）"
+        );
+    }
+
+    // ── 18: matches_query テスト ────────────────────────────────────────────
+
+    /// 空クエリは常に true。
+    #[test]
+    fn matches_query_empty_always_true() {
+        assert!(matches_query("", &["foo", "bar"]), "空クエリは true");
+        assert!(matches_query("   ", &["foo"]), "空白のみも true");
+        assert!(matches_query("", &[]), "フィールドなしでも空クエリは true");
+    }
+
+    /// 大文字小文字を無視して部分一致する。
+    #[test]
+    fn matches_query_case_insensitive() {
+        assert!(
+            matches_query("TANA", &["tanaterm"]),
+            "大文字クエリ → 小文字フィールドにヒット"
+        );
+        assert!(
+            matches_query("tana", &["TANATERM"]),
+            "小文字クエリ → 大文字フィールドにヒット"
+        );
+        assert!(
+            matches_query("Term", &["tanaterm"]),
+            "混在クエリ → 部分一致"
+        );
+    }
+
+    /// 複数語は AND 検索（すべての語がどこかにヒット）。
+    #[test]
+    fn matches_query_multi_word_and() {
+        // 両語がそれぞれ別フィールドにヒットする → true。
+        assert!(
+            matches_query("dev work", &["tanaterm·dev", "~/work/tanaterm"]),
+            "各語が別フィールドにヒット → true"
+        );
+        // 一方の語がどのフィールドにもヒットしない → false。
+        assert!(
+            !matches_query("dev nohit", &["tanaterm·dev", "~/work/tanaterm"]),
+            "どのフィールドにもヒットしない語がある → false"
+        );
+    }
+
+    /// どのフィールドにも当たらない語があれば false。
+    #[test]
+    fn matches_query_no_match_returns_false() {
+        assert!(
+            !matches_query("zzz", &["foo", "bar", "baz"]),
+            "マッチしない語 → false"
+        );
+        assert!(
+            !matches_query("foo bar zzz", &["foo", "bar"]),
+            "一語でもミスなら false"
+        );
+    }
+
+    // ── 20: コマンド履歴永続化テスト ─────────────────────────────────────────
+
+    /// to_persistent → from_persistent で history が復元される。
+    #[test]
+    fn persistent_roundtrip_preserves_history() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        // s3 の履歴を手動でセットする。
+        if let Some(sess) = s.active_mut() {
+            sess.history = vec!["ls".into(), "pwd".into(), "echo hello".into()];
+        }
+        let restored = AppState::from_persistent(s.to_persistent());
+        let s3 = restored.sessions.iter().find(|x| x.id == "s3").unwrap();
+        assert_eq!(
+            s3.history,
+            vec!["ls", "pwd", "echo hello"],
+            "to_persistent → from_persistent で history が復元される"
+        );
+        // history_cursor は None に戻る。
+        assert!(
+            s3.history_cursor.is_none(),
+            "復元後の history_cursor は None"
+        );
+    }
+
+    /// 200 件超の history は末尾 200 件に切り詰められる。
+    #[test]
+    fn persistent_history_truncated_to_200() {
+        let mut s = fresh();
+        s.focus_session("s3");
+        // 250 件の履歴を追加する。
+        if let Some(sess) = s.active_mut() {
+            sess.history = (0..250u32).map(|i| format!("cmd{i}")).collect();
+        }
+        let p = s.to_persistent();
+        let ps3 = p.sessions.iter().find(|x| x.id == "s3").unwrap();
+        assert_eq!(ps3.history.len(), 200, "250 件は 200 件に切り詰められる");
+        // 末尾 200 件（cmd50..cmd249）が残る。
+        assert_eq!(
+            ps3.history.first().map(String::as_str),
+            Some("cmd50"),
+            "先頭は cmd50"
+        );
+        assert_eq!(
+            ps3.history.last().map(String::as_str),
+            Some("cmd249"),
+            "末尾は cmd249"
+        );
+    }
+
+    // ── 21: first_placeholder_range テスト ────────────────────────────────────
+
+    /// placeholder を含む文字列からの範囲検出。
+    #[test]
+    fn first_placeholder_range_detects_svc() {
+        // "docker compose logs -f $svc" → `$svc` の char 範囲を返す。
+        let s = "docker compose logs -f $svc";
+        let result = first_placeholder_range(s);
+        assert!(result.is_some(), "placeholder が検出されるべき");
+        let (start, end) = result.unwrap();
+        assert_eq!(
+            &s[s.char_indices().nth(start).unwrap().0
+                ..s.char_indices().nth(end).map(|(b, _)| b).unwrap_or(s.len())],
+            "$svc",
+            "検出範囲は '$svc' であるべき: start={start}, end={end}"
+        );
+    }
+
+    /// `$` 単独・数字始まりは対象外。
+    #[test]
+    fn first_placeholder_range_ignores_dollar_alone_and_numeric() {
+        // "$" 単独と "$1" は対象外。
+        assert!(
+            first_placeholder_range("echo $$ $1").is_none(),
+            "$ 単独・$1 は対象外"
+        );
+    }
+
+    /// 有効な placeholder の検出: "grep $name | head"
+    #[test]
+    fn first_placeholder_range_detects_name() {
+        let s = "grep $name | head";
+        let result = first_placeholder_range(s);
+        assert!(result.is_some(), "placeholder が検出されるべき");
+        let (start, end) = result.unwrap();
+        let chars: Vec<char> = s.chars().collect();
+        let got: String = chars[start..end].iter().collect();
+        assert_eq!(got, "$name", "検出範囲は '$name' であるべき");
+    }
+
+    /// placeholder なし → None。
+    #[test]
+    fn first_placeholder_range_returns_none_for_no_placeholder() {
+        assert!(
+            first_placeholder_range("ls -la").is_none(),
+            "placeholder なしは None"
+        );
+        assert!(
+            first_placeholder_range("df -h").is_none(),
+            "シンプルなコマンドは None"
+        );
+    }
+
+    /// `insert_command` が placeholder 範囲と focus フラグをセットする。
+    #[test]
+    fn insert_command_sets_select_range_and_focus_pending() {
+        let mut s = fresh();
+        s.ui.focus_input_pending = false;
+        s.ui.input_select_range = None;
+        // seed の c3 = "ps aux | grep $name"
+        s.insert_command("c3", 0.0);
+        assert!(
+            s.ui.focus_input_pending,
+            "insert_command で focus_input_pending が立つ"
+        );
+        assert!(
+            s.ui.input_select_range.is_some(),
+            "placeholder ありで input_select_range がセットされる"
+        );
+        let buf = s.active().unwrap().input_buffer.clone();
+        assert_eq!(buf, "ps aux | grep $name", "input_buffer にコマンドが入る");
+    }
+
+    /// placeholder がないコマンドの `insert_command` では input_select_range が None。
+    #[test]
+    fn insert_command_no_placeholder_sets_range_none() {
+        let mut s = fresh();
+        s.ui.input_select_range = Some((0, 5)); // 事前に何か入っていても
+                                                // seed の c1 = "df -h"（placeholder なし）
+        s.insert_command("c1", 0.0);
+        assert!(
+            s.ui.input_select_range.is_none(),
+            "placeholder なしなら input_select_range は None"
+        );
+        // focus_input_pending は立つ（コマンド挿入後は常にフォーカス）
+        assert!(
+            s.ui.focus_input_pending,
+            "placeholder なしでも focus_input_pending は立つ"
+        );
     }
 }

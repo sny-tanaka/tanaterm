@@ -9,7 +9,7 @@
 use eframe::egui;
 
 use crate::clock;
-use crate::state::{AppState, Command};
+use crate::state::{matches_query, AppState, Command};
 use crate::theme;
 use crate::ui::left_rail::rename_edit;
 use crate::ui::widgets::{self, row, text_button, RowState};
@@ -46,6 +46,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(6.0);
+                    // Decision Log「Commands にカウント数値は出さない」に従い plain 見出し。
                     widgets::section_header_plain(ui, "PINNED");
                     commands_section(ui, state, Section::Pinned);
                 });
@@ -55,6 +56,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(6.0);
+                    // Decision Log「Commands にカウント数値は出さない」に従い plain 見出し。
                     widgets::section_header_plain(ui, "RECENT");
                     commands_section(ui, state, Section::Recent);
                 });
@@ -153,10 +155,15 @@ fn command_add(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
+    // グローバル検索クエリで cmd / desc をフィルタする（18: グローバル検索）。
+    let q = state.ui.search_query.clone();
     let mut entries: Vec<(String, Option<u64>)> = state
         .commands
         .iter()
-        .filter(|c| section.contains(c))
+        .filter(|c| {
+            section.contains(c)
+                && matches_query(&q, &[c.cmd.as_str(), c.desc.as_deref().unwrap_or("")])
+        })
         .map(|c| (c.id.clone(), c.last_used))
         .collect();
     // RECENT は最終実行が新しい順に並べる（PINNED は登録順のまま）。
@@ -169,9 +176,14 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
     if ids.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(theme::spacing::PAD_X);
-            let msg = match section {
-                Section::Pinned => "no pinned commands",
-                Section::Recent => "no recent commands",
+            // 検索で 0 件になった場合は「no matches」、元から空なら従来の文言。
+            let msg = if !q.trim().is_empty() {
+                "no matches"
+            } else {
+                match section {
+                    Section::Pinned => "no pinned commands",
+                    Section::Recent => "no recent commands",
+                }
             };
             ui.label(egui::RichText::new(msg).size(11.0).color(theme::FG_3));
         });
@@ -179,6 +191,10 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
     }
 
     let last_idx = ids.len().saturating_sub(1);
+    // ScrollArea の外で確定した幅を渡す（widgets::row の不変条件）。
+    // -12.0 はスクロールバー幅控除。ScrollArea 内で available_width() を使うと
+    // SidePanel が content 幅に広がる正のフィードバックが発生するため。
+    let row_w = (ui.available_width() - 12.0).max(80.0);
     egui::ScrollArea::vertical()
         .id_source(match section {
             Section::Pinned => "rail_r_pinned_scroll",
@@ -187,7 +203,6 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
         .auto_shrink([false, false]) // パネルの残り高さを埋める
         .show(ui, |ui| {
             ui.add_space(theme::spacing::PAD_Y);
-            let row_w = (ui.available_width() - 12.0).max(80.0);
             for (i, id) in ids.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
