@@ -438,11 +438,7 @@ fn draw_block(
             cmd_line(ui, block, err, font_size);
             if collapsed {
                 // 折りたたみ中: 行数を数えて Dim で表示する。
-                let line_count: usize = block
-                    .output
-                    .iter()
-                    .map(|s| s.text.chars().filter(|&c| c == '\n').count())
-                    .sum();
+                let line_count = block_line_count(&block.output);
                 ui.label(
                     egui::RichText::new(format!("{line_count} 行を折りたたみ中"))
                         .color(theme::FG_3)
@@ -666,6 +662,16 @@ fn format_elapsed(secs: u64) -> String {
         let m = (secs % 3600) / 60;
         format!("{h}h{m:02}m")
     }
+}
+
+/// ブロック出力の表示行数（折りたたみ表示用）。
+///
+/// `'\n'` の個数を数え、末尾が改行で終わらないテキストがあれば最終行として +1 する
+/// （`"abc"` のような改行なし出力が「0 行」にならないようにする）。
+fn block_line_count(output: &[OutputSpan]) -> usize {
+    let newlines: usize = output.iter().map(|s| s.text.matches('\n').count()).sum();
+    let trailing_line = output.last().is_some_and(|s| !s.text.ends_with('\n'));
+    newlines + usize::from(trailing_line)
 }
 
 fn output(ui: &mut egui::Ui, block: &Block, font_size: f32) {
@@ -909,8 +915,11 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
                     if restart_resp.clicked() {
                         do_restart = true;
                     }
-                    // Enter キーでも restart を呼べる（フォーカスは無いがグローバルに拾う）。
-                    if ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
+                    // Enter キーでも restart を呼べる。ただし他ウィジェット（rename /
+                    // 検索欄 / command 追加フォーム）にフォーカスがある間は発火させない
+                    // （rename 確定の Enter 等でシェルが再起動してしまうのを防ぐ）。
+                    let nothing_focused = ui.ctx().memory(|m| m.focused().is_none());
+                    if nothing_focused && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
                         do_restart = true;
                     }
                 } else if has_active {
@@ -1059,7 +1068,36 @@ fn input_line(ui: &mut egui::Ui, state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_elapsed, truncate_for_hint};
+    use super::{block_line_count, format_elapsed, truncate_for_hint};
+    use crate::state::{OutputColor, OutputSpan};
+
+    fn span(text: &str) -> OutputSpan {
+        OutputSpan {
+            color: OutputColor::Default,
+            text: text.to_string(),
+        }
+    }
+
+    /// 折りたたみ表示の行数: '\n' 数 + 末尾の改行なし行。
+    #[test]
+    fn block_line_count_counts_trailing_partial_line() {
+        assert_eq!(block_line_count(&[]), 0, "空出力は 0 行");
+        assert_eq!(
+            block_line_count(&[span("abc")]),
+            1,
+            "改行なしの単一行は 1 行"
+        );
+        assert_eq!(
+            block_line_count(&[span("a\nb\n")]),
+            2,
+            "改行で終わる 2 行は 2 行"
+        );
+        assert_eq!(
+            block_line_count(&[span("a\n"), span("b")]),
+            2,
+            "span 跨ぎ + 末尾改行なしは 2 行"
+        );
+    }
 
     #[test]
     fn truncate_for_hint_keeps_short_strings_as_is() {

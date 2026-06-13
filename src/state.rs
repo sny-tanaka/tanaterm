@@ -1435,9 +1435,9 @@ pub(crate) fn trim_output_front(
         match found {
             Some(c) => cut_char_idx = c,
             None => {
-                // '\n' が見つからない → output 全体をクリア。
-                output.clear();
-                return true;
+                // '\n' が全く無い（改行なしの巨大な単一行）→ 行境界に揃えられないため
+                // chars_to_drop 位置で行中カットする。全消去すると keep 分まで失われる。
+                cut_char_idx = chars_to_drop;
             }
         }
     }
@@ -2816,6 +2816,22 @@ mod tests {
         // 40 文字 > max=20, keep=10 。
         let result = trim_output_front(&mut output, 20, 10);
         assert!(result, "削った場合は true");
+    }
+
+    /// 改行が一切無い巨大な単一行でも全消去せず、末尾 keep_chars 分が残ること。
+    #[test]
+    fn trim_output_front_single_line_without_newline_keeps_tail() {
+        // 50 文字・改行なし。max=30, keep=20 → 先頭 30 文字を行中カットで削る。
+        let text: String = ('a'..='z').cycle().take(50).collect();
+        let mut output = vec![make_span(&text)];
+        let result = trim_output_front(&mut output, 30, 20);
+        assert!(result, "削った場合は true");
+        let remaining: String = output.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            remaining,
+            text.chars().skip(30).collect::<String>(),
+            "末尾 20 文字が残る（全消去しない）"
+        );
     }
 
     // ── 18: matches_query テスト ────────────────────────────────────────────

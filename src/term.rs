@@ -12,7 +12,8 @@
 //!   ブロックを区切る。exit code は取れないため err バッジは出さない（仕様サブセット）。
 //!
 //! ANSI(SGR) 色は `OutputSpan`（既存 mock と同じ型）に変換し、`central.rs` の
-//! 既存描画経路をそのまま使う。`\r` 上書きや全画面 TUI は忠実には扱わない（後続課題）。
+//! 既存描画経路をそのまま使う。`\r` 上書きは行単位で対応（`TermAction::OverwriteLine`）、
+//! 全画面 TUI は alternate screen の検知のみ（描画は非対応でバナー表示に縮退）。
 
 use crate::state::{OutputColor, OutputSpan};
 
@@ -249,6 +250,10 @@ enum EscState {
     Esc,
     /// `ESC [`（CSI）パラメータ収集中。
     Csi,
+    /// nF エスケープ（`ESC ( B` 等の charset 指定）の中間バイト（0x20–0x2F）を受けた。
+    /// 最終バイト（0x30–0x7E）まで読み飛ばす。これがないと `ESC ( B` の `B` が
+    /// テキストとして出力に漏れる。
+    EscIntermediate,
 }
 
 impl SgrConverter {
@@ -347,8 +352,19 @@ impl SgrConverter {
                         self.esc = EscState::Csi;
                         self.params.clear();
                         self.has_intermediate = false;
+                    } else if (0x20..=0x2f).contains(&b) {
+                        // nF エスケープ（ECMA-48: ESC I.. F、I = 0x20–0x2F、F = 0x30–0x7E）。
+                        // `ESC ( B`（charset 指定）等。最終バイトまで読み飛ばす。
+                        self.esc = EscState::EscIntermediate;
                     } else {
-                        // CSI 以外のエスケープ（`ESC ( B` 等）は 1 バイトで打ち切る簡易処理。
+                        // 上記以外のエスケープ（`ESC =` / `ESC >` 等）は 1 バイトで打ち切る。
+                        self.esc = EscState::Text;
+                    }
+                    i += 1;
+                }
+                EscState::EscIntermediate => {
+                    // 中間バイト（0x20–0x2F）が続く間は読み飛ばし、それ以外（最終バイト）で終了。
+                    if !(0x20..=0x2f).contains(&b) {
                         self.esc = EscState::Text;
                     }
                     i += 1;
@@ -605,6 +621,11 @@ pub struct SessionTerm {
     /// OSC 133 モードで PromptStart（A）を受信してプロンプト表示中か（05: detached output）。
     /// `true` の間（A〜C）は出力を捨てる（プロンプト本文）。
     /// `CommandStart`（C）で false、`PromptStart`（A）で true にセットする。
+    ///
+    /// **既知の制限**: detached output として捕捉できるのは D〜A の窓に届いた出力のみ。
+    /// zsh の非同期ジョブ通知（`[1] + done ...`）はプロンプト表示中（= `at_prompt` 中）に
+    /// 届くことが多く、プロンプト再描画と区別できないため依然として捨てられる。
+    /// 完全に拾うには OSC 133;B（プロンプト終了）の併用等が必要（後続課題）。
     at_prompt: bool,
     /// Auto モードでのエコー除去用: `on_submit` に渡されたコマンド文字列（06）。
     /// `None` = 判定済み or Osc133 モード。
@@ -1028,6 +1049,36 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "ab");
+    }
+
+    /// nF エスケープ（`ESC ( B` 等の charset 指定）の最終バイトがテキストに漏れない。
+    #[test]
+    fn sgr_charset_escape_final_byte_not_leaked() {
+        let mut c = SgrConverter::new();
+        let events = c.convert(b"a\x1b(Bb");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ab", "`ESC ( B` の `B` が出力に混入しない");
+
+        // 中間バイトが複数続く場合（ESC SP SP F）も最終バイトまで読み飛ばす。
+        let events = c.convert(b"x\x1b  Fy");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                SgrEvent::Spans(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "xy", "中間バイト複数の nF エスケープも漏れない");
     }
 
     #[test]

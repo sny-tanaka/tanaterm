@@ -46,20 +46,8 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(6.0);
-                    // フィルタ後の件数をカウントして section_header に渡す。
-                    let q = state.ui.search_query.clone();
-                    let pinned_count = state
-                        .commands
-                        .iter()
-                        .filter(|c| {
-                            Section::Pinned.contains(c)
-                                && matches_query(
-                                    &q,
-                                    &[c.cmd.as_str(), c.desc.as_deref().unwrap_or("")],
-                                )
-                        })
-                        .count();
-                    widgets::section_header(ui, "PINNED", pinned_count);
+                    // Decision Log「Commands にカウント数値は出さない」に従い plain 見出し。
+                    widgets::section_header_plain(ui, "PINNED");
                     commands_section(ui, state, Section::Pinned);
                 });
 
@@ -68,20 +56,8 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .frame(egui::Frame::none())
                 .show_inside(ui, |ui| {
                     ui.add_space(6.0);
-                    // フィルタ後の件数をカウントして section_header に渡す。
-                    let q = state.ui.search_query.clone();
-                    let recent_count = state
-                        .commands
-                        .iter()
-                        .filter(|c| {
-                            Section::Recent.contains(c)
-                                && matches_query(
-                                    &q,
-                                    &[c.cmd.as_str(), c.desc.as_deref().unwrap_or("")],
-                                )
-                        })
-                        .count();
-                    widgets::section_header(ui, "RECENT", recent_count);
+                    // Decision Log「Commands にカウント数値は出さない」に従い plain 見出し。
+                    widgets::section_header_plain(ui, "RECENT");
                     commands_section(ui, state, Section::Recent);
                 });
         });
@@ -179,10 +155,15 @@ fn command_add(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
+    // グローバル検索クエリで cmd / desc をフィルタする（18: グローバル検索）。
+    let q = state.ui.search_query.clone();
     let mut entries: Vec<(String, Option<u64>)> = state
         .commands
         .iter()
-        .filter(|c| section.contains(c))
+        .filter(|c| {
+            section.contains(c)
+                && matches_query(&q, &[c.cmd.as_str(), c.desc.as_deref().unwrap_or("")])
+        })
         .map(|c| (c.id.clone(), c.last_used))
         .collect();
     // RECENT は最終実行が新しい順に並べる（PINNED は登録順のまま）。
@@ -195,9 +176,14 @@ fn commands_section(ui: &mut egui::Ui, state: &mut AppState, section: Section) {
     if ids.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(theme::spacing::PAD_X);
-            let msg = match section {
-                Section::Pinned => "no pinned commands",
-                Section::Recent => "no recent commands",
+            // 検索で 0 件になった場合は「no matches」、元から空なら従来の文言。
+            let msg = if !q.trim().is_empty() {
+                "no matches"
+            } else {
+                match section {
+                    Section::Pinned => "no pinned commands",
+                    Section::Recent => "no recent commands",
+                }
             };
             ui.label(egui::RichText::new(msg).size(11.0).color(theme::FG_3));
         });
